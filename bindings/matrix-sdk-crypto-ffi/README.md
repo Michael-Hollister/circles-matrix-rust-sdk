@@ -7,6 +7,30 @@ targeting an x86 Linux project.
 
 To build and distribute bindings for iOS projects, see a [dedicated page](../apple/README.md)
 
+## FUTO Changes
+
+### Prerequisites
+
+Install the rust [`cross`](https://github.com/cross-rs/cross) compilation tool: `cargo install cross --git https://github.com/cross-rs/cross`
+
+Note that you will need to have Docker installed and have the daemon running.
+
+### Building
+
+1. Ensure you are in the `matrix-sdk-crypto-ffi` directory
+2. `cross build --target aarch64-linux-android`
+
+After that, a dynamic library can be found in the `target/aarch64-linux-android/debug` directory.
+The library will be called `libmatrix_crypto.so` and needs to be renamed and
+copied into the `jniLibs` directory of your Android project, for Element Android:
+
+```
+$ cp ../../target/aarch64-linux-android/debug/libmatrix_crypto.so \
+     /home/example/matrix-sdk-android/src/main/jniLibs/aarch64/libuniffi_olm.so
+```
+
+## Original build process
+
 ## Prerequisites
 
 ### Rust
