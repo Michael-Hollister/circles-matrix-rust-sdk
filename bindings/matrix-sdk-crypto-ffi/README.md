@@ -9,25 +9,16 @@ To build and distribute bindings for iOS projects, see a [dedicated page](../app
 
 ## FUTO Changes
 
-### Prerequisites
+Docker image provided for building Android libraries. Image is also setup to build libraries
+from `circles-rust-components-kotlin`
 
-Install the rust [`cross`](https://github.com/cross-rs/cross) compilation tool: `cargo install cross --git https://github.com/cross-rs/cross`
+From repo root:
+* Building image: `docker build --tag futo/matrix_sdk_crypto_ffi_builder:latest .`
+* Running image: `docker run -it --rm -v .:/matrix-rust-sdk -v <ABSOLUTE_PATH_TO_REPO>:/circles-rust-components-kotlin futo/matrix_sdk_crypto_ffi_builder`
 
-Note that you will need to have Docker installed and have the daemon running.
-
-### Building
-
-1. Ensure you are in the `matrix-sdk-crypto-ffi` directory
-2. `cross build --target aarch64-linux-android`
-
-After that, a dynamic library can be found in the `target/aarch64-linux-android/debug` directory.
-The library will be called `libmatrix_crypto.so` and needs to be renamed and
-copied into the `jniLibs` directory of your Android project, for Element Android:
-
-```
-$ cp ../../target/aarch64-linux-android/debug/libmatrix_crypto.so \
-     /home/example/matrix-sdk-android/src/main/jniLibs/aarch64/libuniffi_olm.so
-```
+From building libraries (from bindings/matrix-sdk-crypto-ffi):
+* Debug build: `cargo ndk --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android --target i686-linux-android build`
+* Release build: `cargo ndk --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android --target i686-linux-android build --release`
 
 ## Original build process
 

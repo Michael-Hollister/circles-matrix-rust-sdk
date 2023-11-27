@@ -34,12 +34,6 @@ uniffi = { workspace = true }
 vodozemac = { workspace = true }
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 
-[package.metadata.cross.target.aarch64-linux-android]
-pre-build = [
-    "apt-get update && apt-get install --assume-yes pkg-config libssl-dev",
-    "cp /usr/include/x86_64-linux-gnu/openssl/opensslconf.h /usr/include/openssl/opensslconf.h",
-]
-
 [dependencies.js_int]
 version = "0.2.2"
 features = ["lax_deserialize"]
