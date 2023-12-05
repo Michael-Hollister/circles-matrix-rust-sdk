@@ -7,6 +7,25 @@ targeting an x86 Linux project.
 
 To build and distribute bindings for iOS projects, see a [dedicated page](../apple/README.md)
 
+## FUTO Changes
+
+Docker image provided for building Android libraries. Image is also setup to build libraries
+from `circles-rust-components-kotlin`
+
+To build on Mac M1:
+* Uncheck "Use Rosetta for x86/amd64 emulation on Apple Silicon" in Docker desktop settings
+* Building image: `docker build --platform linux/amd64 --tag futo/matrix_sdk_crypto_ffi_builder:latest .`
+
+From repo root:
+* Building image: `docker build --tag futo/matrix_sdk_crypto_ffi_builder:latest .`
+* Running image: `docker run -it --rm -v .:/matrix-rust-sdk -v <ABSOLUTE_PATH_TO_REPO>:/circles-rust-components-kotlin futo/matrix_sdk_crypto_ffi_builder`
+
+From building libraries (from bindings/matrix-sdk-crypto-ffi):
+* Debug build: `cargo ndk --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android --target i686-linux-android build`
+* Release build: `cargo ndk --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android --target i686-linux-android build --release`
+
+## Original build process
+
 ## Prerequisites
 
 ### Rust
