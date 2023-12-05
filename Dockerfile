@@ -32,8 +32,6 @@ ENV ANDROID_API_VERSION=33
 ENV NDK_CLANG_VERSION=17
 ENV PATH $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
 
-# Build fixes
-RUN cp /usr/include/x86_64-linux-gnu/openssl/opensslconf.h /usr/include/openssl/opensslconf.h
 RUN yes | /root/Android/Sdk/ndk/$ANDROID_NDK_VERSION/cmdline-tools/bin/sdkmanager --licenses --sdk_root=/root/Android/Sdk/ndk/26.1.10909125/
 
 RUN mkdir /matrix-rust-sdk
