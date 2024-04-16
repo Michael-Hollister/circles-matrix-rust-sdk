@@ -36,6 +36,11 @@ pub struct TimelineItem {
 }
 
 impl TimelineItem {
+    /// Create a new `TimelineItem` with the given kind and internal id.
+    pub(crate) fn new(kind: impl Into<TimelineItemKind>, internal_id: u64) -> Arc<Self> {
+        Arc::new(TimelineItem { kind: kind.into(), internal_id })
+    }
+
     pub(crate) fn with_kind(&self, kind: impl Into<TimelineItemKind>) -> Arc<Self> {
         Arc::new(Self { kind: kind.into(), internal_id: self.internal_id })
     }
@@ -84,11 +89,13 @@ impl TimelineItem {
         matches!(&self.kind, TimelineItemKind::Event(ev) if ev.is_remote_event())
     }
 
-    pub(crate) fn is_virtual(&self) -> bool {
-        matches!(self.kind, TimelineItemKind::Virtual(_))
+    pub(crate) fn is_event(&self) -> bool {
+        matches!(&self.kind, TimelineItemKind::Event(_))
     }
 
-    pub(crate) fn is_day_divider(&self) -> bool {
+    /// Check whether this item is a day divider.
+    #[must_use]
+    pub fn is_day_divider(&self) -> bool {
         matches!(self.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)))
     }
 
@@ -115,11 +122,4 @@ impl From<VirtualTimelineItem> for TimelineItemKind {
     fn from(item: VirtualTimelineItem) -> Self {
         Self::Virtual(item)
     }
-}
-
-pub(crate) fn timeline_item(
-    kind: impl Into<TimelineItemKind>,
-    internal_id: u64,
-) -> Arc<TimelineItem> {
-    Arc::new(TimelineItem { kind: kind.into(), internal_id })
 }

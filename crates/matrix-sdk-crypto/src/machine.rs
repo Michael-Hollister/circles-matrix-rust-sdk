@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
@@ -27,9 +27,9 @@ use ruma::{
     api::client::{
         dehydrated_device::DehydratedDeviceData,
         keys::{
-            claim_keys::v3::{Request as KeysClaimRequest, Response as KeysClaimResponse},
+            claim_keys::v3::Request as KeysClaimRequest,
             get_keys::v3::Response as KeysQueryResponse,
-            upload_keys,
+            upload_keys::v3::{Request as UploadKeysRequest, Response as UploadKeysResponse},
             upload_signatures::v3::Request as UploadSignaturesRequest,
         },
         sync::sync_events::DeviceLists,
@@ -37,13 +37,14 @@ use ruma::{
     assign,
     events::{
         room::history_visibility::HistoryVisibility, secret::request::SecretName,
-        AnyMessageLikeEvent, AnyToDeviceEvent, MessageLikeEventContent,
+        AnyMessageLikeEvent, AnyMessageLikeEventContent, AnyToDeviceEvent,
+        MessageLikeEventContent,
     },
     serde::Raw,
-    DeviceId, DeviceKeyAlgorithm, OwnedDeviceId, OwnedDeviceKeyId, OwnedTransactionId, OwnedUserId,
-    RoomId, TransactionId, UInt, UserId,
+    DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedDeviceKeyId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
-use serde_json::{value::to_raw_value, Value};
+use serde_json::value::to_raw_value;
 use tokio::sync::Mutex;
 use tracing::{
     debug, error,
@@ -55,23 +56,23 @@ use vodozemac::{
     Curve25519PublicKey, Ed25519Signature,
 };
 
-#[cfg(feature = "backups_v1")]
-use crate::backups::BackupMachine;
 use crate::{
+    backups::{BackupMachine, MegolmV1BackupKey},
     dehydrated_devices::{DehydratedDevices, DehydrationError},
-    error::{EventError, MegolmError, MegolmResult, OlmError, OlmResult},
+    error::{EventError, MegolmError, MegolmResult, OlmError, OlmResult, SetRoomSettingsError},
     gossiping::GossipMachine,
     identities::{user::UserIdentities, Device, IdentityManager, UserDevices},
     olm::{
         Account, CrossSigningStatus, EncryptionSettings, ExportedRoomKey, IdentityKeys,
         InboundGroupSession, OlmDecryptionInfo, PrivateCrossSigningIdentity, SessionType,
+        StaticAccountData,
     },
     requests::{IncomingResponse, OutgoingRequest, UploadSigningKeysRequest},
     session_manager::{GroupSessionManager, SessionManager},
     store::{
         Changes, CryptoStoreWrapper, DeviceChanges, IdentityChanges, IntoCryptoStore, MemoryStore,
-        PendingChanges, Result as StoreResult, RoomKeyInfo, SecretImportError, Store,
-        StoreTransaction,
+        PendingChanges, Result as StoreResult, RoomKeyInfo, RoomSettings, SecretImportError, Store,
+        StoreCache, StoreTransaction,
     },
     types::{
         events::{
@@ -86,8 +87,9 @@ use crate::{
             },
             ToDeviceEvents,
         },
-        Signatures,
+        EventEncryptionAlgorithm, Signatures,
     },
+    utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
     CrossSigningKeyExport, CryptoStoreError, KeysQueryRequest, LocalTrust, ReadOnlyDevice,
     RoomKeyImportResult, SignatureError, ToDeviceRequest,
@@ -128,7 +130,6 @@ pub struct OlmMachineInner {
     /// of when a key query needs to be done and handling one.
     identity_manager: IdentityManager,
     /// A state machine that handles creating room key backups.
-    #[cfg(feature = "backups_v1")]
     backup_machine: BackupMachine,
 }
 
@@ -169,31 +170,39 @@ impl OlmMachine {
     ) -> Result<OlmMachine, DehydrationError> {
         let account =
             Account::rehydrate(pickle_key, self.user_id(), device_id, device_data).await?;
+        let static_account = account.static_data().clone();
 
         let store = Arc::new(CryptoStoreWrapper::new(self.user_id(), MemoryStore::new()));
+        store.save_pending_changes(PendingChanges { account: Some(account) }).await?;
 
-        Ok(Self::new_helper(device_id, store, account, self.store().private_identity()))
+        Ok(Self::new_helper(
+            device_id,
+            store,
+            static_account,
+            self.store().private_identity(),
+            None,
+        ))
     }
 
     fn new_helper(
         device_id: &DeviceId,
         store: Arc<CryptoStoreWrapper>,
-        account: Account,
+        account: StaticAccountData,
         user_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
+        maybe_backup_key: Option<MegolmV1BackupKey>,
     ) -> Self {
-        let verification_machine = VerificationMachine::new(
-            account.static_data().clone(),
-            user_identity.clone(),
-            store.clone(),
-        );
-        let store =
-            Store::new(account.clone(), user_identity.clone(), store, verification_machine.clone());
+        let verification_machine =
+            VerificationMachine::new(account.clone(), user_identity.clone(), store.clone());
+        let store = Store::new(account, user_identity.clone(), store, verification_machine.clone());
 
         let group_session_manager = GroupSessionManager::new(store.clone());
+
+        let identity_manager = IdentityManager::new(store.clone());
 
         let users_for_key_claim = Arc::new(StdRwLock::new(BTreeMap::new()));
         let key_request_machine = GossipMachine::new(
             store.clone(),
+            identity_manager.clone(),
             group_session_manager.session_cache(),
             users_for_key_claim.clone(),
         );
@@ -201,10 +210,7 @@ impl OlmMachine {
         let session_manager =
             SessionManager::new(users_for_key_claim, key_request_machine.clone(), store.clone());
 
-        #[cfg(feature = "backups_v1")]
-        let backup_machine = BackupMachine::new(store.clone(), None);
-
-        let identity_manager = IdentityManager::new(store.clone());
+        let backup_machine = BackupMachine::new(store.clone(), maybe_backup_key);
 
         let inner = Arc::new(OlmMachineInner {
             user_id: store.user_id().to_owned(),
@@ -216,7 +222,6 @@ impl OlmMachine {
             verification_machine,
             key_request_machine,
             identity_manager,
-            #[cfg(feature = "backups_v1")]
             backup_machine,
         });
 
@@ -249,7 +254,8 @@ impl OlmMachine {
         store: impl IntoCryptoStore,
     ) -> StoreResult<Self> {
         let store = store.into_crypto_store();
-        let account = match store.load_account().await? {
+
+        let static_account = match store.load_account().await? {
             Some(account) => {
                 if user_id != account.user_id() || device_id != account.device_id() {
                     return Err(CryptoStoreError::MismatchedAccount {
@@ -263,16 +269,18 @@ impl OlmMachine {
                     .record("curve25519_key", display(account.identity_keys().curve25519));
                 debug!("Restored an Olm account");
 
-                account
+                account.static_data().clone()
             }
+
             None => {
                 let account = Account::with_device_id(user_id, device_id);
+                let static_account = account.static_data().clone();
 
                 Span::current()
                     .record("ed25519_key", display(account.identity_keys().ed25519))
                     .record("curve25519_key", display(account.identity_keys().curve25519));
 
-                let device = ReadOnlyDevice::from_account(&account).await;
+                let device = ReadOnlyDevice::from_account(&account);
 
                 // We just created this device from our own Olm `Account`. Since we are the
                 // owners of the private keys of this device we can safely mark
@@ -284,13 +292,11 @@ impl OlmMachine {
                     ..Default::default()
                 };
                 store.save_changes(changes).await?;
-                store
-                    .save_pending_changes(PendingChanges { account: Some(account.clone()) })
-                    .await?;
+                store.save_pending_changes(PendingChanges { account: Some(account) }).await?;
 
                 debug!("Created a new Olm account");
 
-                account
+                static_account
             }
         };
 
@@ -309,9 +315,21 @@ impl OlmMachine {
             }
         };
 
+        let saved_keys = store.load_backup_keys().await?;
+        let maybe_backup_key = saved_keys.decryption_key.and_then(|k| {
+            if let Some(version) = saved_keys.backup_version {
+                MegolmV1BackupKey::from_base64(&k.to_base64()).ok().map(|k| {
+                    k.set_version(version);
+                    k
+                })
+            } else {
+                None
+            }
+        });
+
         let identity = Arc::new(Mutex::new(identity));
         let store = Arc::new(CryptoStoreWrapper::new(user_id, store));
-        Ok(OlmMachine::new_helper(device_id, store, account, identity))
+        Ok(OlmMachine::new_helper(device_id, store, static_account, identity, maybe_backup_key))
     }
 
     /// Get the crypto store associated with this `OlmMachine` instance.
@@ -327,6 +345,16 @@ impl OlmMachine {
     /// The unique device ID that identifies this `OlmMachine`.
     pub fn device_id(&self) -> &DeviceId {
         &self.inner.device_id
+    }
+
+    /// The time at which the `Account` backing this `OlmMachine` was created.
+    ///
+    /// An [`Account`] is created when an `OlmMachine` is first instantiated
+    /// against a given [`Store`], at which point it creates identity keys etc.
+    /// This method returns the timestamp, according to the local clock, at
+    /// which that happened.
+    pub fn device_creation_time(&self) -> MilliSecondsSinceUnixEpoch {
+        self.inner.store.static_account().creation_local_time()
     }
 
     /// Get the public parts of our Olm identity keys.
@@ -345,20 +373,47 @@ impl OlmMachine {
     /// See [`update_tracked_users`](#method.update_tracked_users) for more
     /// information.
     pub async fn tracked_users(&self) -> StoreResult<HashSet<OwnedUserId>> {
-        self.store().tracked_users().await
+        let cache = self.store().cache().await?;
+        Ok(self.inner.identity_manager.key_query_manager.synced(&cache).await?.tracked_users())
+    }
+
+    /// Enable or disable room key requests.
+    ///
+    /// Room key requests allow the device to request room keys that it might
+    /// have missed in the original share using `m.room_key_request`
+    /// events.
+    ///
+    /// See also [`OlmMachine::set_room_key_forwarding_enabled`] and
+    /// [`OlmMachine::are_room_key_requests_enabled`].
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    pub fn set_room_key_requests_enabled(&self, enable: bool) {
+        self.inner.key_request_machine.set_room_key_requests_enabled(enable)
+    }
+
+    /// Query whether we should send outgoing `m.room_key_request`s on
+    /// decryption failure.
+    ///
+    /// See also [`OlmMachine::set_room_key_requests_enabled`].
+    pub fn are_room_key_requests_enabled(&self) -> bool {
+        self.inner.key_request_machine.are_room_key_requests_enabled()
     }
 
     /// Enable or disable room key forwarding.
     ///
-    /// Room key forwarding allows the device to request room keys that it might
-    /// have missend in the original share using `m.room_key_request`
-    /// events.
+    /// If room key forwarding is enabled, we will automatically reply to
+    /// incoming `m.room_key_request` messages from verified devices by
+    /// forwarding the requested key (if we have it).
+    ///
+    /// See also [`OlmMachine::set_room_key_requests_enabled`] and
+    /// [`OlmMachine::is_room_key_forwarding_enabled`].
     #[cfg(feature = "automatic-room-key-forwarding")]
-    pub fn toggle_room_key_forwarding(&self, enable: bool) {
-        self.inner.key_request_machine.toggle_room_key_forwarding(enable)
+    pub fn set_room_key_forwarding_enabled(&self, enable: bool) {
+        self.inner.key_request_machine.set_room_key_forwarding_enabled(enable)
     }
 
     /// Is room key forwarding enabled?
+    ///
+    /// See also [`OlmMachine::set_room_key_forwarding_enabled`].
     pub fn is_room_key_forwarding_enabled(&self) -> bool {
         self.inner.key_request_machine.is_room_key_forwarding_enabled()
     }
@@ -374,13 +429,12 @@ impl OlmMachine {
         let mut requests = Vec::new();
 
         {
-            let mut store_transaction = self.inner.store.transaction().await?;
-            let account = store_transaction.account().await?;
-            if let Some(r) = self.keys_for_upload(account).await.map(|r| OutgoingRequest {
+            let store_cache = self.inner.store.cache().await?;
+            let account = store_cache.account().await?;
+            if let Some(r) = self.keys_for_upload(&account).await.map(|r| OutgoingRequest {
                 request_id: TransactionId::new(),
                 request: Arc::new(r.into()),
             }) {
-                store_transaction.commit().await?; // Note: this saves the account.
                 requests.push(r);
             }
         }
@@ -406,6 +460,9 @@ impl OlmMachine {
     ///
     /// This can be useful if we need the results from [`get_identity`] or
     /// [`get_user_devices`] to be as up-to-date as possible.
+    ///
+    /// Note that this request won't be awaited by other calls waiting for a
+    /// user's or device's keys, since this is an out-of-band query.
     ///
     /// # Arguments
     ///
@@ -442,19 +499,22 @@ impl OlmMachine {
     ) -> OlmResult<()> {
         match response.into() {
             IncomingResponse::KeysUpload(response) => {
-                self.receive_keys_upload_response(response).await?;
+                Box::pin(self.receive_keys_upload_response(response)).await?;
             }
             IncomingResponse::KeysQuery(response) => {
-                self.receive_keys_query_response(request_id, response).await?;
+                Box::pin(self.receive_keys_query_response(request_id, response)).await?;
             }
             IncomingResponse::KeysClaim(response) => {
-                self.receive_keys_claim_response(response).await?;
+                Box::pin(
+                    self.inner.session_manager.receive_keys_claim_response(request_id, response),
+                )
+                .await?;
             }
             IncomingResponse::ToDevice(_) => {
-                self.mark_to_device_request_as_sent(request_id).await?;
+                Box::pin(self.mark_to_device_request_as_sent(request_id)).await?;
             }
             IncomingResponse::SigningKeysUpload(_) => {
-                self.receive_cross_signing_upload_response().await?;
+                Box::pin(self.receive_cross_signing_upload_response()).await?;
             }
             IncomingResponse::SignatureUpload(_) => {
                 self.inner.verification_machine.mark_request_as_sent(request_id);
@@ -463,8 +523,7 @@ impl OlmMachine {
                 self.inner.verification_machine.mark_request_as_sent(request_id);
             }
             IncomingResponse::KeysBackup(_) => {
-                #[cfg(feature = "backups_v1")]
-                self.inner.backup_machine.mark_request_as_sent(request_id).await?;
+                Box::pin(self.inner.backup_machine.mark_request_as_sent(request_id)).await?;
             }
         };
 
@@ -484,15 +543,17 @@ impl OlmMachine {
     /// Create a new cross signing identity and get the upload request to push
     /// the new public keys to the server.
     ///
-    /// **Warning**: This will delete any existing cross signing keys that might
-    /// exist on the server and thus will reset the trust between all the
-    /// devices.
+    /// **Warning**: if called with `reset`, this will delete any existing cross
+    /// signing keys that might exist on the server and thus will reset the
+    /// trust between all the devices.
     ///
     /// # Returns
     ///
-    /// A pair of requests which should be sent out to the server. Once
-    /// sent, the responses should be passed back to the state machine using
-    /// [`mark_request_as_sent`].
+    /// A triple of requests which should be sent out to the server, in the
+    /// order they appear in the return tuple.
+    ///
+    /// The first request's response, if present, should be passed back to the
+    /// state machine using [`mark_request_as_sent`].
     ///
     /// These requests may require user interactive auth.
     ///
@@ -500,62 +561,79 @@ impl OlmMachine {
     pub async fn bootstrap_cross_signing(
         &self,
         reset: bool,
-    ) -> StoreResult<(UploadSigningKeysRequest, UploadSignaturesRequest)> {
+    ) -> StoreResult<CrossSigningBootstrapRequests> {
         let mut identity = self.inner.user_identity.lock().await;
 
-        if reset || identity.is_empty().await {
+        let (upload_signing_keys_req, upload_signatures_req) = if reset || identity.is_empty().await
+        {
             info!("Creating new cross signing identity");
-            let account = &self.inner.store.cache().await?.account;
-            let (id, request, signature_request) = account.bootstrap_cross_signing().await;
 
-            *identity = id;
+            let (new_identity, upload_signing_keys_req, upload_signatures_req) = {
+                let cache = self.inner.store.cache().await?;
+                let account = cache.account().await?;
+                account.bootstrap_cross_signing().await
+            };
+
+            *identity = new_identity;
 
             let public = identity.to_public_identity().await.expect(
                 "Couldn't create a public version of the identity from a new private identity",
             );
 
-            let changes = Changes {
-                identities: IdentityChanges { new: vec![public.into()], ..Default::default() },
-                private_identity: Some(identity.clone()),
-                ..Default::default()
-            };
+            self.store()
+                .save_changes(Changes {
+                    identities: IdentityChanges { new: vec![public.into()], ..Default::default() },
+                    private_identity: Some(identity.clone()),
+                    ..Default::default()
+                })
+                .await?;
 
-            self.store().save_changes(changes).await?;
-
-            Ok((request, signature_request))
+            (upload_signing_keys_req, upload_signatures_req)
         } else {
             info!("Trying to upload the existing cross signing identity");
-            let request = identity.as_upload_request().await;
-            let account = self.inner.store.static_account();
+            let upload_signing_keys_req = identity.as_upload_request().await;
+
             // TODO remove this expect.
-            let signature_request =
-                identity.sign_account(account).await.expect("Can't sign device keys");
-            Ok((request, signature_request))
-        }
+            let upload_signatures_req = identity
+                .sign_account(self.inner.store.static_account())
+                .await
+                .expect("Can't sign device keys");
+
+            (upload_signing_keys_req, upload_signatures_req)
+        };
+
+        // If there are any *device* keys to upload (i.e. the account isn't shared),
+        // upload them before we upload the signatures, since the signatures may
+        // reference keys to be uploaded.
+        let upload_keys_req = {
+            let cache = self.store().cache().await?;
+            let account = cache.account().await?;
+            if account.shared() {
+                None
+            } else {
+                self.keys_for_upload(&account).await.map(OutgoingRequest::from)
+            }
+        };
+
+        Ok(CrossSigningBootstrapRequests {
+            upload_signing_keys_req,
+            upload_keys_req,
+            upload_signatures_req,
+        })
     }
 
-    /// Get the underlying Olm account of the machine.
-    #[cfg(any(test, feature = "testing"))]
-    #[allow(dead_code)]
-    pub(crate) async fn account(&self) -> Result<Account, CryptoStoreError> {
-        Ok(self.inner.store.cache().await?.account.clone())
-    }
-
-    /// Receive a successful keys upload response.
+    /// Receive a successful `/keys/upload` response.
     ///
     /// # Arguments
     ///
-    /// * `response` - The keys upload response of the request that the client
-    /// performed.
-    async fn receive_keys_upload_response(
-        &self,
-        response: &upload_keys::v3::Response,
-    ) -> OlmResult<()> {
+    /// * `response` - The response of the `/keys/upload` request that the
+    ///   client performed.
+    async fn receive_keys_upload_response(&self, response: &UploadKeysResponse) -> OlmResult<()> {
         self.inner
             .store
             .with_transaction(|mut tr| async {
                 let account = tr.account().await?;
-                account.receive_keys_upload_response(response).await?;
+                account.receive_keys_upload_response(response)?;
                 Ok((tr, ()))
             })
             .await
@@ -588,6 +666,7 @@ impl OlmMachine {
     /// this method between sync requests.
     ///
     /// [`mark_request_as_sent`]: #method.mark_request_as_sent
+    #[instrument(skip_all)]
     pub async fn get_missing_sessions(
         &self,
         users: impl Iterator<Item = &UserId>,
@@ -595,25 +674,15 @@ impl OlmMachine {
         self.inner.session_manager.get_missing_sessions(users).await
     }
 
-    /// Receive a successful key claim response and create new Olm sessions with
-    /// the claimed keys.
-    ///
-    /// # Arguments
-    ///
-    /// * `response` - The response containing the claimed one-time keys.
-    async fn receive_keys_claim_response(&self, response: &KeysClaimResponse) -> OlmResult<()> {
-        self.inner.session_manager.receive_keys_claim_response(response).await
-    }
-
-    /// Receive a successful keys query response.
+    /// Receive a successful `/keys/query` response.
     ///
     /// Returns a list of devices newly discovered devices and devices that
     /// changed.
     ///
     /// # Arguments
     ///
-    /// * `response` - The keys query response of the request that the client
-    /// performed.
+    /// * `response` - The response of the `/keys/query` request that the client
+    ///   performed.
     async fn receive_keys_query_response(
         &self,
         request_id: &TransactionId,
@@ -630,15 +699,15 @@ impl OlmMachine {
     /// the [`OlmMachine`] with the [`receive_keys_upload_response`].
     ///
     /// [`receive_keys_upload_response`]: #method.receive_keys_upload_response
-    async fn keys_for_upload(&self, account: &Account) -> Option<upload_keys::v3::Request> {
-        let (device_keys, one_time_keys, fallback_keys) = account.keys_for_upload().await;
+    async fn keys_for_upload(&self, account: &Account) -> Option<UploadKeysRequest> {
+        let (device_keys, one_time_keys, fallback_keys) = account.keys_for_upload();
 
         if device_keys.is_none() && one_time_keys.is_empty() && fallback_keys.is_empty() {
             None
         } else {
             let device_keys = device_keys.map(|d| d.to_raw());
 
-            Some(assign!(upload_keys::v3::Request::new(), {
+            Some(assign!(UploadKeysRequest::new(), {
                 device_keys, one_time_keys, fallback_keys
             }))
         }
@@ -663,7 +732,7 @@ impl OlmMachine {
 
         // Handle the decrypted event, e.g. fetch out Megolm sessions out of
         // the event.
-        self.handle_decrypted_to_device_event(&mut decrypted, changes).await?;
+        self.handle_decrypted_to_device_event(transaction.cache(), &mut decrypted, changes).await?;
 
         Ok(decrypted)
     }
@@ -758,7 +827,7 @@ impl OlmMachine {
     }
 
     #[cfg(test)]
-    pub(crate) async fn create_outbound_group_session_with_defaults(
+    pub(crate) async fn create_outbound_group_session_with_defaults_test_helper(
         &self,
         room_id: &RoomId,
     ) -> OlmResult<()> {
@@ -775,7 +844,7 @@ impl OlmMachine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(crate) async fn create_inbound_session(
+    pub(crate) async fn create_inbound_session_test_helper(
         &self,
         room_id: &RoomId,
     ) -> OlmResult<InboundGroupSession> {
@@ -810,11 +879,11 @@ impl OlmMachine {
         content: impl MessageLikeEventContent,
     ) -> MegolmResult<Raw<RoomEncryptedEventContent>> {
         let event_type = content.event_type().to_string();
-        let content = serde_json::to_value(&content)?;
-        self.encrypt_room_event_raw(room_id, content, &event_type).await
+        let content = Raw::new(&content)?.cast();
+        self.encrypt_room_event_raw(room_id, &event_type, &content).await
     }
 
-    /// Encrypt a json [`Value`] content for the given room.
+    /// Encrypt a raw JSON content for the given room.
     ///
     /// This method is equivalent to the [`OlmMachine::encrypt_room_event()`]
     /// method but operates on an arbitrary JSON value instead of strongly-typed
@@ -826,7 +895,7 @@ impl OlmMachine {
     /// encrypted.
     ///
     /// * `content` - The plaintext content of the message that should be
-    /// encrypted as a json [`Value`].
+    /// encrypted as a raw JSON value.
     ///
     /// * `event_type` - The plaintext type of the event.
     ///
@@ -836,18 +905,23 @@ impl OlmMachine {
     pub async fn encrypt_room_event_raw(
         &self,
         room_id: &RoomId,
-        content: Value,
         event_type: &str,
+        content: &Raw<AnyMessageLikeEventContent>,
     ) -> MegolmResult<Raw<RoomEncryptedEventContent>> {
-        self.inner.group_session_manager.encrypt(room_id, content, event_type).await
+        self.inner.group_session_manager.encrypt(room_id, event_type, content).await
     }
 
-    /// Invalidate the currently active outbound group session for the given
-    /// room.
+    /// Forces the currently active room key, which is used to encrypt messages,
+    /// to be rotated.
+    ///
+    /// A new room key will be crated and shared with all the room members the
+    /// next time a message will be sent. You don't have to call this method,
+    /// room keys will be rotated automatically when necessary. This method is
+    /// still useful for debugging purposes.
     ///
     /// Returns true if a session was invalidated, false if there was no session
     /// to invalidate.
-    pub async fn invalidate_group_session(&self, room_id: &RoomId) -> StoreResult<bool> {
+    pub async fn discard_room_key(&self, room_id: &RoomId) -> StoreResult<bool> {
         self.inner.group_session_manager.invalidate_group_session(room_id).await
     }
 
@@ -861,7 +935,15 @@ impl OlmMachine {
     /// `users` - The list of users that should receive the room key.
     ///
     /// `settings` - Encryption settings that affect when are room keys rotated
-    /// and who are they shared with
+    /// and who are they shared with.
+    ///
+    /// # Returns
+    ///
+    /// List of the to-device requests that need to be sent out to the server
+    /// and the responses need to be passed back to the state machine with
+    /// [`mark_request_as_sent`], using the to-device `txn_id` as `request_id`.
+    ///
+    /// [`mark_request_as_sent`]: #method.mark_request_as_sent
     pub async fn share_room_key(
         &self,
         room_id: &RoomId,
@@ -1010,6 +1092,7 @@ impl OlmMachine {
     )]
     async fn handle_decrypted_to_device_event(
         &self,
+        cache: &StoreCache,
         decrypted: &mut OlmDecryptionInfo,
         changes: &mut Changes,
     ) -> OlmResult<()> {
@@ -1032,7 +1115,7 @@ impl OlmMachine {
                 let name = self
                     .inner
                     .key_request_machine
-                    .receive_secret_event(decrypted.result.sender_key, e, changes)
+                    .receive_secret_event(cache, decrypted.result.sender_key, e, changes)
                     .await?;
 
                 // Set the secret name so other consumers of the event know
@@ -1142,7 +1225,7 @@ impl OlmMachine {
         transaction: &mut StoreTransaction,
         changes: &mut Changes,
         mut raw_event: Raw<AnyToDeviceEvent>,
-    ) -> OlmResult<Raw<AnyToDeviceEvent>> {
+    ) -> Raw<AnyToDeviceEvent> {
         Self::record_message_id(&raw_event);
 
         let event: ToDeviceEvents = match raw_event.deserialize_as() {
@@ -1151,7 +1234,7 @@ impl OlmMachine {
                 // Skip invalid events.
                 warn!("Received an invalid to-device event: {e}");
 
-                return Ok(raw_event);
+                return raw_event;
             }
         };
 
@@ -1176,7 +1259,7 @@ impl OlmMachine {
                             }
                         }
 
-                        return Ok(raw_event);
+                        return raw_event;
                     }
                 };
 
@@ -1213,7 +1296,7 @@ impl OlmMachine {
             e => self.handle_to_device_event(changes, &e).await,
         }
 
-        Ok(raw_event)
+        raw_event
     }
 
     /// Handle a to-device and one-time key counts from a sync response.
@@ -1221,18 +1304,12 @@ impl OlmMachine {
     /// This will decrypt and handle to-device events returning the decrypted
     /// versions of them.
     ///
-    /// To decrypt an event from the room timeline call [`decrypt_room_event`].
+    /// To decrypt an event from the room timeline, call [`decrypt_room_event`].
     ///
     /// # Arguments
     ///
-    /// * `to_device_events` - The to-device events of the current sync
-    /// response.
-    ///
-    /// * `changed_devices` - The list of devices that changed in this sync
-    /// response.
-    ///
-    /// * `one_time_keys_count` - The current one-time keys counts that the sync
-    /// response returned.
+    /// * `sync_changes` - an [`EncryptionSyncChanges`] value, constructed from
+    ///   a sync response.
     ///
     /// [`decrypt_room_event`]: #method.decrypt_room_event
     ///
@@ -1244,7 +1321,7 @@ impl OlmMachine {
         &self,
         sync_changes: EncryptionSyncChanges<'_>,
     ) -> OlmResult<(Vec<Raw<AnyToDeviceEvent>>, Vec<RoomKeyInfo>)> {
-        let mut store_transaction = self.inner.store.transaction().await?;
+        let mut store_transaction = self.inner.store.transaction().await;
 
         let (events, changes) =
             self.preprocess_sync_changes(&mut store_transaction, sync_changes).await?;
@@ -1274,18 +1351,19 @@ impl OlmMachine {
 
         {
             let account = transaction.account().await?;
-            account
-                .update_key_counts(
-                    sync_changes.one_time_keys_counts,
-                    sync_changes.unused_fallback_keys,
-                )
-                .await;
+            account.update_key_counts(
+                sync_changes.one_time_keys_counts,
+                sync_changes.unused_fallback_keys,
+            )
         }
 
         if let Err(e) = self
             .inner
             .identity_manager
-            .receive_device_changes(sync_changes.changed_devices.changed.iter().map(|u| u.as_ref()))
+            .receive_device_changes(
+                transaction.cache(),
+                sync_changes.changed_devices.changed.iter().map(|u| u.as_ref()),
+            )
             .await
         {
             error!(error = ?e, "Error marking a tracked user as changed");
@@ -1293,13 +1371,15 @@ impl OlmMachine {
 
         for raw_event in sync_changes.to_device_events {
             let raw_event =
-                Box::pin(self.receive_to_device_event(transaction, &mut changes, raw_event))
-                    .await?;
+                Box::pin(self.receive_to_device_event(transaction, &mut changes, raw_event)).await;
             events.push(raw_event);
         }
 
-        let changed_sessions =
-            self.inner.key_request_machine.collect_incoming_key_requests().await?;
+        let changed_sessions = self
+            .inner
+            .key_request_machine
+            .collect_incoming_key_requests(transaction.cache())
+            .await?;
 
         changes.sessions.extend(changed_sessions);
         changes.next_batch_token = sync_changes.next_batch_token;
@@ -1422,10 +1502,8 @@ impl OlmMachine {
     /// ```
     pub async fn query_missing_secrets_from_other_sessions(&self) -> StoreResult<bool> {
         let identity = self.inner.user_identity.lock().await;
-        #[allow(unused_mut)]
         let mut secrets = identity.get_missing_secrets().await;
 
-        #[cfg(feature = "backups_v1")]
         if self.store().load_backup_keys().await?.decryption_key.is_none() {
             secrets.push(SecretName::RecoveryKey);
         }
@@ -1437,7 +1515,7 @@ impl OlmMachine {
 
         let secret_requests = GossipMachine::request_missing_secrets(self.user_id(), secrets);
 
-        // Check if there are already inflight requests for these secrets?
+        // Check if there are already in-flight requests for these secrets?
         let unsent_request = self.store().get_unsent_secret_requests().await?;
         let not_yet_requested = secret_requests
             .into_iter()
@@ -1575,7 +1653,7 @@ impl OlmMachine {
     /// * `event` - The event that should be decrypted.
     ///
     /// * `room_id` - The ID of the room where the event was sent to.
-    #[instrument(skip_all, fields(?room_id, event_id, sender, algorithm, session_id, sender_key))]
+    #[instrument(skip_all, fields(?room_id, event_id, origin_server_ts, sender, algorithm, session_id, sender_key))]
     pub async fn decrypt_room_event(
         &self,
         event: &Raw<EncryptedEvent>,
@@ -1586,6 +1664,11 @@ impl OlmMachine {
         tracing::Span::current()
             .record("sender", debug(&event.sender))
             .record("event_id", debug(&event.event_id))
+            .record(
+                "origin_server_ts",
+                timestamp_to_iso8601(event.origin_server_ts)
+                    .unwrap_or_else(|| "<out of range>".to_owned()),
+            )
             .record("algorithm", debug(event.content.algorithm()));
 
         let content: SupportedEventEncryptionSchemes<'_> = match &event.content.scheme {
@@ -1623,6 +1706,16 @@ impl OlmMachine {
         }
 
         result
+    }
+
+    /// Do we have the room key for the given room and with the given session id
+    /// in the store?
+    pub async fn is_room_key_available(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<bool, CryptoStoreError> {
+        Ok(self.store().get_inbound_group_session(room_id, session_id).await?.is_some())
     }
 
     /// Get encryption info for a decrypted timeline event.
@@ -1680,10 +1773,20 @@ impl OlmMachine {
         self.inner.identity_manager.update_tracked_users(users).await
     }
 
-    async fn wait_if_user_pending(&self, user_id: &UserId, timeout: Option<Duration>) {
+    async fn wait_if_user_pending(
+        &self,
+        user_id: &UserId,
+        timeout: Option<Duration>,
+    ) -> StoreResult<()> {
         if let Some(timeout) = timeout {
-            self.store().wait_if_user_key_query_pending(timeout, user_id).await;
+            let cache = self.store().cache().await?;
+            self.inner
+                .identity_manager
+                .key_query_manager
+                .wait_if_user_key_query_pending(cache, timeout, user_id)
+                .await?;
         }
+        Ok(())
     }
 
     /// Get a specific device of a user.
@@ -1715,13 +1818,14 @@ impl OlmMachine {
     /// println!("{:?}", device);
     /// # });
     /// ```
+    #[instrument(skip(self))]
     pub async fn get_device(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
         timeout: Option<Duration>,
     ) -> StoreResult<Option<Device>> {
-        self.wait_if_user_pending(user_id, timeout).await;
+        self.wait_if_user_pending(user_id, timeout).await?;
         self.store().get_device(user_id, device_id).await
     }
 
@@ -1738,12 +1842,13 @@ impl OlmMachine {
     ///
     /// Returns a `UserIdentities` enum if one is found and the crypto store
     /// didn't throw an error.
+    #[instrument(skip(self))]
     pub async fn get_identity(
         &self,
         user_id: &UserId,
         timeout: Option<Duration>,
     ) -> StoreResult<Option<UserIdentities>> {
-        self.wait_if_user_pending(user_id, timeout).await;
+        self.wait_if_user_pending(user_id, timeout).await?;
         self.store().get_identity(user_id).await
     }
 
@@ -1773,12 +1878,13 @@ impl OlmMachine {
     /// }
     /// # });
     /// ```
+    #[instrument(skip(self))]
     pub async fn get_user_devices(
         &self,
         user_id: &UserId,
         timeout: Option<Duration>,
     ) -> StoreResult<UserDevices> {
-        self.wait_if_user_pending(user_id, timeout).await;
+        self.wait_if_user_pending(user_id, timeout).await?;
         self.store().get_user_devices(user_id).await
     }
 
@@ -1812,121 +1918,17 @@ impl OlmMachine {
     /// machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
     /// # };
     /// ```
+    #[deprecated(
+        since = "0.7.0",
+        note = "Use the OlmMachine::store::import_exported_room_keys method instead"
+    )]
     pub async fn import_room_keys(
         &self,
         exported_keys: Vec<ExportedRoomKey>,
-        #[allow(unused_variables)] from_backup: bool,
+        from_backup: bool,
         progress_listener: impl Fn(usize, usize),
     ) -> StoreResult<RoomKeyImportResult> {
-        let mut sessions = Vec::new();
-
-        async fn new_session_better(
-            session: &InboundGroupSession,
-            old_session: Option<InboundGroupSession>,
-        ) -> bool {
-            if let Some(old_session) = &old_session {
-                session.compare(old_session).await == SessionOrdering::Better
-            } else {
-                true
-            }
-        }
-
-        let total_count = exported_keys.len();
-        let mut keys = BTreeMap::new();
-
-        for (i, key) in exported_keys.into_iter().enumerate() {
-            match InboundGroupSession::from_export(&key) {
-                Ok(session) => {
-                    let old_session = self
-                        .inner
-                        .store
-                        .get_inbound_group_session(session.room_id(), session.session_id())
-                        .await?;
-
-                    // Only import the session if we didn't have this session or
-                    // if it's a better version of the same session.
-                    if new_session_better(&session, old_session).await {
-                        #[cfg(feature = "backups_v1")]
-                        if from_backup {
-                            session.mark_as_backed_up();
-                        }
-
-                        keys.entry(session.room_id().to_owned())
-                            .or_insert_with(BTreeMap::new)
-                            .entry(session.sender_key().to_base64())
-                            .or_insert_with(BTreeSet::new)
-                            .insert(session.session_id().to_owned());
-
-                        sessions.push(session);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        sender_key= key.sender_key.to_base64(),
-                        room_id = ?key.room_id,
-                        session_id = key.session_id,
-                        error = ?e,
-                        "Couldn't import a room key from a file export."
-                    );
-                }
-            }
-
-            progress_listener(i, total_count);
-        }
-
-        let imported_count = sessions.len();
-
-        let changes = Changes { inbound_group_sessions: sessions, ..Default::default() };
-
-        self.store().save_changes(changes).await?;
-
-        info!(total_count, imported_count, room_keys = ?keys, "Successfully imported room keys");
-
-        Ok(RoomKeyImportResult::new(imported_count, total_count, keys))
-    }
-
-    /// Export the keys that match the given predicate.
-    ///
-    /// # Arguments
-    ///
-    /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSession` will be included in the export,
-    /// if the closure returns `false` it will not be included.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use matrix_sdk_crypto::{OlmMachine, encrypt_room_key_export};
-    /// # use ruma::{device_id, user_id, room_id};
-    /// # let alice = user_id!("@alice:example.org");
-    /// # async {
-    /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
-    /// let room_id = room_id!("!test:localhost");
-    /// let exported_keys = machine.export_room_keys(|s| s.room_id() == room_id).await.unwrap();
-    /// let encrypted_export = encrypt_room_key_export(&exported_keys, "1234", 1);
-    /// # };
-    /// ```
-    pub async fn export_room_keys(
-        &self,
-        mut predicate: impl FnMut(&InboundGroupSession) -> bool,
-    ) -> StoreResult<Vec<ExportedRoomKey>> {
-        let mut exported = Vec::new();
-
-        let sessions: Vec<InboundGroupSession> = self
-            .store()
-            .get_inbound_group_sessions()
-            .await?
-            .into_iter()
-            .filter(|s| predicate(s))
-            .collect();
-
-        for session in sessions {
-            let export = session.export().await;
-            exported.push(export);
-        }
-
-        Ok(exported)
+        self.store().import_room_keys(exported_keys, from_backup, progress_listener).await
     }
 
     /// Get the status of the private cross signing keys.
@@ -1989,10 +1991,13 @@ impl OlmMachine {
     pub async fn sign(&self, message: &str) -> Result<Signatures, CryptoStoreError> {
         let mut signatures = Signatures::new();
 
-        let account = &self.inner.store.cache().await?.account;
-        let key_id = account.signing_key_id();
-        let signature = account.sign(message).await;
-        signatures.add_signature(self.user_id().to_owned(), key_id, signature);
+        {
+            let cache = self.inner.store.cache().await?;
+            let account = cache.account().await?;
+            let key_id = account.signing_key_id();
+            let signature = account.sign(message);
+            signatures.add_signature(self.user_id().to_owned(), key_id, signature);
+        }
 
         match self.sign_with_master_key(message).await {
             Ok((key_id, signature)) => {
@@ -2010,7 +2015,6 @@ impl OlmMachine {
     ///
     /// This state machine can be used to incrementally backup all room keys to
     /// the server.
-    #[cfg(feature = "backups_v1")]
     pub fn backup_machine(&self) -> &BackupMachine {
         &self.inner.backup_machine
     }
@@ -2041,6 +2045,8 @@ impl OlmMachine {
             None => 0,
         };
 
+        tracing::debug!("Initialising crypto store generation at {}", gen);
+
         self.inner
             .store
             .set_custom_value(Self::CURRENT_GENERATION_STORE_KEY, gen.to_le_bytes().to_vec())
@@ -2053,19 +2059,32 @@ impl OlmMachine {
 
     /// If needs be, update the local and on-disk crypto store generation.
     ///
-    /// Returns true whether another user has modified the internal generation
-    /// counter, and as such we've incremented and updated it in the
-    /// database.
-    ///
     /// ## Requirements
     ///
     /// - This assumes that `initialize_crypto_store_generation` has been called
     /// beforehand.
     /// - This requires that the crypto store lock has been acquired.
-    pub async fn maintain_crypto_store_generation(
-        &self,
+    ///
+    /// # Arguments
+    ///
+    /// * `generation` - The in-memory generation counter (or rather, the
+    ///   `Mutex` wrapping it). This defines the "expected" generation on entry,
+    ///   and, if we determine an update is needed, is updated to hold the "new"
+    ///   generation.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    ///
+    /// * A `bool`, set to `true` if another process has updated the generation
+    ///   number in the `Store` since our expected value, and as such we've
+    ///   incremented and updated it in the database. Otherwise, `false`.
+    ///
+    /// * The (possibly updated) generation counter.
+    pub async fn maintain_crypto_store_generation<'a>(
+        &'a self,
         generation: &Mutex<Option<u64>>,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<(bool, u64)> {
         let mut gen_guard = generation.lock().await;
 
         // The database value must be there:
@@ -2087,10 +2106,10 @@ impl OlmMachine {
                 CryptoStoreError::InvalidLockGeneration("invalid format".to_owned())
             })?);
 
-        let expected_gen = match gen_guard.as_ref() {
+        let new_gen = match gen_guard.as_ref() {
             Some(expected_gen) => {
                 if actual_gen == *expected_gen {
-                    return Ok(false);
+                    return Ok((false, actual_gen));
                 }
                 // Increment the biggest, and store it everywhere.
                 actual_gen.max(*expected_gen).wrapping_add(1)
@@ -2106,27 +2125,107 @@ impl OlmMachine {
             "Crypto store generation mismatch: previously known was {:?}, actual is {:?}, next is {}",
             *gen_guard,
             actual_gen,
-            expected_gen
+            new_gen
         );
 
         // Update known value.
-        *gen_guard = Some(expected_gen);
+        *gen_guard = Some(new_gen);
 
         // Update value in database.
         self.inner
             .store
-            .set_custom_value(
-                Self::CURRENT_GENERATION_STORE_KEY,
-                expected_gen.to_le_bytes().to_vec(),
-            )
+            .set_custom_value(Self::CURRENT_GENERATION_STORE_KEY, new_gen.to_le_bytes().to_vec())
             .await?;
 
-        Ok(true)
+        Ok((true, new_gen))
     }
 
     /// Manage dehydrated devices.
     pub fn dehydrated_devices(&self) -> DehydratedDevices {
         DehydratedDevices { inner: self.to_owned() }
+    }
+
+    /// Get the stored encryption settings for the given room, such as the
+    /// encryption algorithm or whether to encrypt only for trusted devices.
+    ///
+    /// These settings can be modified via [`OlmMachine::set_room_settings`].
+    pub async fn room_settings(&self, room_id: &RoomId) -> StoreResult<Option<RoomSettings>> {
+        // There's not much to do here: it's just exposed for symmetry with
+        // `set_room_settings`.
+        self.inner.store.get_room_settings(room_id).await
+    }
+
+    /// Store encryption settings for the given room.
+    ///
+    /// This method checks if the new settings are "safe" -- ie, that they do
+    /// not represent a downgrade in encryption security from any previous
+    /// settings. Attempts to downgrade security will result in a
+    /// [`SetRoomSettingsError::EncryptionDowngrade`].
+    ///
+    /// If the settings are valid, they will be persisted to the crypto store.
+    /// These settings are not used directly by this library, but the saved
+    /// settings can be retrieved via [`OlmMachine::room_settings`].
+    pub async fn set_room_settings(
+        &self,
+        room_id: &RoomId,
+        new_settings: &RoomSettings,
+    ) -> Result<(), SetRoomSettingsError> {
+        let store = &self.inner.store;
+
+        // We want to make sure that we do not race against a second concurrent call to
+        // `set_room_settings`. By way of an easy way to do so, we start a
+        // StoreTransaction. There's no need to commit() it: we're just using it as a
+        // lock guard.
+        let _store_transaction = store.transaction().await;
+
+        let old_settings = store.get_room_settings(room_id).await?;
+
+        // We want to make sure that the change to the room settings does not represent
+        // a downgrade in security. The [E2EE implementation guide] recommends:
+        //
+        //  > This flag should **not** be cleared if a later `m.room.encryption` event
+        //  > changes the configuration.
+        //
+        // (However, it doesn't really address how to handle changes to the rotation
+        // parameters, etc.) For now at least, we are very conservative here:
+        // any new settings are rejected if they differ from the existing settings.
+        // merit improvement (cf https://github.com/element-hq/element-meta/issues/69).
+        //
+        // [E2EE implementation guide]: https://matrix.org/docs/matrix-concepts/end-to-end-encryption/#handling-an-m-room-encryption-state-event
+        if let Some(old_settings) = old_settings {
+            if old_settings != *new_settings {
+                return Err(SetRoomSettingsError::EncryptionDowngrade);
+            } else {
+                // nothing to do here
+                return Ok(());
+            }
+        }
+
+        // Make sure that the new settings are valid
+        match new_settings.algorithm {
+            EventEncryptionAlgorithm::MegolmV1AesSha2 => (),
+
+            #[cfg(feature = "experimental-algorithms")]
+            EventEncryptionAlgorithm::MegolmV2AesSha2 => (),
+
+            _ => {
+                warn!(
+                    ?room_id,
+                    "Rejecting invalid encryption algorithm {}", new_settings.algorithm
+                );
+                return Err(SetRoomSettingsError::InvalidSettings);
+            }
+        }
+
+        // The new settings are acceptable, so let's save them.
+        store
+            .save_changes(Changes {
+                room_settings: HashMap::from([(room_id.to_owned(), new_settings.clone())]),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(())
     }
 
     #[cfg(any(feature = "testing", test))]
@@ -2140,8 +2239,34 @@ impl OlmMachine {
     /// Testing purposes only.
     #[cfg(any(feature = "testing", test))]
     pub async fn uploaded_key_count(&self) -> Result<u64, CryptoStoreError> {
-        Ok(self.inner.store.cache().await?.account.uploaded_key_count())
+        let cache = self.inner.store.cache().await?;
+        let account = cache.account().await?;
+        Ok(account.uploaded_key_count())
     }
+}
+
+/// A set of requests to be executed when bootstrapping cross-signing using
+/// [`OlmMachine::bootstrap_cross_signing`].
+#[derive(Debug)]
+pub struct CrossSigningBootstrapRequests {
+    /// An optional request to upload a device key.
+    ///
+    /// Should be sent first, if present.
+    ///
+    /// If present, its result must be processed back with
+    /// `OlmMachine::mark_request_as_sent`.
+    pub upload_keys_req: Option<OutgoingRequest>,
+
+    /// Request to upload the cross-signing keys.
+    ///
+    /// Should be sent second.
+    pub upload_signing_keys_req: UploadSigningKeysRequest,
+
+    /// Request to upload key signatures, including those for the cross-signing
+    /// keys, and maybe some for the optional uploaded key too.
+    ///
+    /// Should be sent last.
+    pub upload_signatures_req: UploadSignaturesRequest,
 }
 
 /// Data contained from a sync response and that needs to be processed by the
@@ -2150,9 +2275,10 @@ impl OlmMachine {
 pub struct EncryptionSyncChanges<'a> {
     /// The list of to-device events received in the sync.
     pub to_device_events: Vec<Raw<AnyToDeviceEvent>>,
-    /// The mapping of changed and left devices, per user.
+    /// The mapping of changed and left devices, per user, as returned in the
+    /// sync response.
     pub changed_devices: &'a DeviceLists,
-    /// The number of one time keys.
+    /// The number of one time keys, as returned in the sync response.
     pub one_time_keys_counts: &'a BTreeMap<DeviceKeyAlgorithm, UInt>,
     /// An optional list of fallback keys.
     pub unused_fallback_keys: Option<&'a [DeviceKeyAlgorithm]>,
@@ -2161,8 +2287,8 @@ pub struct EncryptionSyncChanges<'a> {
 }
 
 #[cfg(any(feature = "testing", test))]
+#[allow(dead_code)]
 pub(crate) mod testing {
-    #![allow(dead_code)]
     use http::Response;
 
     pub fn response_from_file(json: &serde_json::Value) -> Response<Vec<u8>> {
@@ -2180,12 +2306,13 @@ pub(crate) mod tests {
     };
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use futures_util::{FutureExt, StreamExt};
     use itertools::Itertools;
     use matrix_sdk_common::deserialized_responses::{
         DeviceLinkProblem, ShieldState, VerificationLevel, VerificationState,
     };
-    use matrix_sdk_test::{async_test, test_json};
+    use matrix_sdk_test::{async_test, message_like_event_content, test_json};
     use ruma::{
         api::{
             client::{
@@ -2208,21 +2335,22 @@ pub(crate) mod tests {
         },
         room_id,
         serde::Raw,
+        to_device::DeviceIdOrAllDevices,
         uint, user_id, DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch,
         OwnedDeviceKeyId, SecondsSinceUnixEpoch, TransactionId, UserId,
     };
-    use serde_json::json;
+    use serde_json::{json, value::to_raw_value};
     use vodozemac::{
         megolm::{GroupSession, SessionConfig},
         Curve25519PublicKey, Ed25519PublicKey,
     };
 
-    use super::testing::response_from_file;
+    use super::{testing::response_from_file, CrossSigningBootstrapRequests};
     use crate::{
-        error::EventError,
+        error::{EventError, SetRoomSettingsError},
         machine::{EncryptionSyncChanges, OlmMachine},
         olm::{InboundGroupSession, OutboundGroupSession, VerifyJson},
-        store::Changes,
+        store::{Changes, RoomSettings},
         types::{
             events::{
                 room::encrypted::{EncryptedToDeviceEvent, ToDeviceEncryptedEventContent},
@@ -2259,13 +2387,13 @@ pub(crate) mod tests {
     fn keys_upload_response() -> upload_keys::v3::Response {
         let data = response_from_file(&test_json::KEYS_UPLOAD);
         upload_keys::v3::Response::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     fn keys_query_response() -> get_keys::v3::Response {
         let data = response_from_file(&test_json::KEYS_QUERY);
         get_keys::v3::Response::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     pub fn to_device_requests_to_content(
@@ -2291,13 +2419,22 @@ pub(crate) mod tests {
     ) -> (OlmMachine, OneTimeKeys) {
         let machine = OlmMachine::new(user_id, bob_device_id()).await;
 
-        let account = machine.account().await.unwrap();
-        account.generate_fallback_key_helper().await;
-        account.update_uploaded_key_count(0);
-        account.generate_one_time_keys().await;
+        let request = machine
+            .store()
+            .with_transaction(|mut tr| async {
+                let account = tr.account().await.unwrap();
+                account.generate_fallback_key_if_needed();
+                account.update_uploaded_key_count(0);
+                account.generate_one_time_keys_if_needed();
+                let request = machine
+                    .keys_for_upload(account)
+                    .await
+                    .expect("Can't prepare initial key upload");
+                Ok((tr, request))
+            })
+            .await
+            .unwrap();
 
-        let request =
-            machine.keys_for_upload(&account).await.expect("Can't prepare initial key upload");
         let response = keys_upload_response();
         machine.receive_keys_upload_response(&response).await.unwrap();
 
@@ -2306,7 +2443,7 @@ pub(crate) mod tests {
         (machine, keys)
     }
 
-    async fn get_machine_after_query() -> (OlmMachine, OneTimeKeys) {
+    async fn get_machine_after_query_test_helper() -> (OlmMachine, OneTimeKeys) {
         let (machine, otk) = get_prepared_machine_test_helper(user_id(), false).await;
         let response = keys_query_response();
         let req_id = TransactionId::new();
@@ -2316,7 +2453,7 @@ pub(crate) mod tests {
         (machine, otk)
     }
 
-    async fn get_machine_pair(
+    pub async fn get_machine_pair(
         alice: &UserId,
         bob: &UserId,
         use_fallback_key: bool,
@@ -2339,21 +2476,20 @@ pub(crate) mod tests {
         bob: &UserId,
         use_fallback_key: bool,
     ) -> (OlmMachine, OlmMachine) {
-        let (alice, bob, one_time_keys) = get_machine_pair(alice, bob, use_fallback_key).await;
+        let (alice, bob, mut one_time_keys) = get_machine_pair(alice, bob, use_fallback_key).await;
 
-        let mut bob_keys = BTreeMap::new();
+        let (device_key_id, one_time_key) = one_time_keys.pop_first().unwrap();
 
-        let (device_key_id, one_time_key) = one_time_keys.iter().next().unwrap();
-        let mut keys = BTreeMap::new();
-        keys.insert(device_key_id.clone(), one_time_key.clone());
-        bob_keys.insert(bob.device_id().into(), keys);
-
-        let mut one_time_keys = BTreeMap::new();
-        one_time_keys.insert(bob.user_id().to_owned(), bob_keys);
+        let one_time_keys = BTreeMap::from([(
+            bob.user_id().to_owned(),
+            BTreeMap::from([(
+                bob.device_id().to_owned(),
+                BTreeMap::from([(device_key_id, one_time_key)]),
+            )]),
+        )]);
 
         let response = claim_keys::v3::Response::new(one_time_keys);
-
-        alice.receive_keys_claim_response(&response).await.unwrap();
+        alice.inner.session_manager.create_sessions(&response).await.unwrap();
 
         (alice, bob)
     }
@@ -2368,10 +2504,8 @@ pub(crate) mod tests {
         let bob_device =
             alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
 
-        let (session, content) = bob_device
-            .encrypt("m.dummy", serde_json::to_value(ToDeviceDummyEventContent::new()).unwrap())
-            .await
-            .unwrap();
+        let (session, content) =
+            bob_device.encrypt("m.dummy", ToDeviceDummyEventContent::new()).await.unwrap();
         alice.store().save_sessions(&[session]).await.unwrap();
 
         let event =
@@ -2394,8 +2528,15 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_create_olm_machine() {
+        let test_start_ts = MilliSecondsSinceUnixEpoch::now();
         let machine = OlmMachine::new(user_id(), alice_device_id()).await;
-        let account = machine.account().await.unwrap();
+
+        let device_creation_time = machine.device_creation_time();
+        assert!(device_creation_time <= MilliSecondsSinceUnixEpoch::now());
+        assert!(device_creation_time >= test_start_ts);
+
+        let cache = machine.store().cache().await.unwrap();
+        let account = cache.account().await.unwrap();
         assert!(!account.shared());
 
         let own_device = machine
@@ -2410,27 +2551,59 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_generate_one_time_keys() {
         let machine = OlmMachine::new(user_id(), alice_device_id()).await;
-        let account = machine.account().await.unwrap();
 
-        assert!(account.generate_one_time_keys().await.is_some());
+        machine
+            .store()
+            .with_transaction(|mut tr| async {
+                let account = tr.account().await.unwrap();
+                assert!(account.generate_one_time_keys_if_needed().is_some());
+                Ok((tr, ()))
+            })
+            .await
+            .unwrap();
 
         let mut response = keys_upload_response();
 
         machine.receive_keys_upload_response(&response).await.unwrap();
-        assert!(account.generate_one_time_keys().await.is_some());
+
+        machine
+            .store()
+            .with_transaction(|mut tr| async {
+                let account = tr.account().await.unwrap();
+                assert!(account.generate_one_time_keys_if_needed().is_some());
+                Ok((tr, ()))
+            })
+            .await
+            .unwrap();
 
         response.one_time_key_counts.insert(DeviceKeyAlgorithm::SignedCurve25519, uint!(50));
+
         machine.receive_keys_upload_response(&response).await.unwrap();
-        assert!(account.generate_one_time_keys().await.is_none());
+
+        machine
+            .store()
+            .with_transaction(|mut tr| async {
+                let account = tr.account().await.unwrap();
+                assert!(account.generate_one_time_keys_if_needed().is_none());
+
+                Ok((tr, ()))
+            })
+            .await
+            .unwrap();
     }
 
     #[async_test]
     async fn test_device_key_signing() {
         let machine = OlmMachine::new(user_id(), alice_device_id()).await;
 
-        let account = machine.account().await.unwrap();
-        let device_keys = account.device_keys().await;
-        let identity_keys = account.identity_keys();
+        let (device_keys, identity_keys) = {
+            let cache = machine.store().cache().await.unwrap();
+            let account = cache.account().await.unwrap();
+            let device_keys = account.device_keys();
+            let identity_keys = account.identity_keys();
+            (device_keys, identity_keys)
+        };
+
         let ed25519_key = identity_keys.ed25519;
 
         let ret = ed25519_key.verify_json(
@@ -2442,14 +2615,14 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn tests_session_invalidation() {
+    async fn test_session_invalidation() {
         let machine = OlmMachine::new(user_id(), alice_device_id()).await;
         let room_id = room_id!("!test:example.org");
 
-        machine.create_outbound_group_session_with_defaults(room_id).await.unwrap();
+        machine.create_outbound_group_session_with_defaults_test_helper(room_id).await.unwrap();
         assert!(machine.inner.group_session_manager.get_outbound_group_session(room_id).is_some());
 
-        machine.invalidate_group_session(room_id).await.unwrap();
+        machine.discard_room_key(room_id).await.unwrap();
 
         assert!(machine
             .inner
@@ -2459,11 +2632,11 @@ pub(crate) mod tests {
             .invalidated());
     }
 
-    #[async_test]
-    async fn test_invalid_signature() {
+    #[test]
+    fn test_invalid_signature() {
         let account = Account::with_device_id(user_id(), alice_device_id());
 
-        let device_keys = account.device_keys().await;
+        let device_keys = account.device_keys();
 
         let key = Ed25519PublicKey::from_slice(&[0u8; 32]).unwrap();
 
@@ -2475,13 +2648,13 @@ pub(crate) mod tests {
         ret.unwrap_err();
     }
 
-    #[async_test]
-    async fn test_one_time_key_signing() {
-        let account = Account::with_device_id(user_id(), alice_device_id());
+    #[test]
+    fn test_one_time_key_signing() {
+        let mut account = Account::with_device_id(user_id(), alice_device_id());
         account.update_uploaded_key_count(49);
-        account.generate_one_time_keys().await;
+        account.generate_one_time_keys_if_needed();
 
-        let mut one_time_keys = account.signed_one_time_keys().await;
+        let mut one_time_keys = account.signed_one_time_keys();
         let ed25519_key = account.identity_keys().ed25519;
 
         let one_time_key: SignedKey = one_time_keys
@@ -2503,6 +2676,7 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_keys_for_upload() {
         let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+
         let key_counts = BTreeMap::from([(DeviceKeyAlgorithm::SignedCurve25519, 49u8.into())]);
         machine
             .receive_sync_changes(EncryptionSyncChanges {
@@ -2515,11 +2689,15 @@ pub(crate) mod tests {
             .await
             .expect("We should be able to update our one-time key counts");
 
-        let account = machine.account().await.unwrap();
-        let ed25519_key = account.identity_keys().ed25519;
+        let (ed25519_key, mut request) = {
+            let cache = machine.store().cache().await.unwrap();
+            let account = cache.account().await.unwrap();
+            let ed25519_key = account.identity_keys().ed25519;
 
-        let mut request =
-            machine.keys_for_upload(&account).await.expect("Can't prepare initial key upload");
+            let request =
+                machine.keys_for_upload(&account).await.expect("Can't prepare initial key upload");
+            (ed25519_key, request)
+        };
 
         let one_time_key: SignedKey = request
             .one_time_keys
@@ -2545,16 +2723,27 @@ pub(crate) mod tests {
         );
         ret.unwrap();
 
-        let mut response = keys_upload_response();
-        response.one_time_key_counts.insert(
-            DeviceKeyAlgorithm::SignedCurve25519,
-            (account.max_one_time_keys().await).try_into().unwrap(),
-        );
+        let response = {
+            let cache = machine.store().cache().await.unwrap();
+            let account = cache.account().await.unwrap();
+
+            let mut response = keys_upload_response();
+            response.one_time_key_counts.insert(
+                DeviceKeyAlgorithm::SignedCurve25519,
+                account.max_one_time_keys().try_into().unwrap(),
+            );
+
+            response
+        };
 
         machine.receive_keys_upload_response(&response).await.unwrap();
 
-        let ret = machine.keys_for_upload(&account).await;
-        assert!(ret.is_none());
+        {
+            let cache = machine.store().cache().await.unwrap();
+            let account = cache.account().await.unwrap();
+            let ret = machine.keys_for_upload(&account).await;
+            assert!(ret.is_none());
+        }
     }
 
     #[async_test]
@@ -2585,7 +2774,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_missing_sessions_calculation() {
-        let (machine, _) = get_machine_after_query().await;
+        let (machine, _) = get_machine_after_query_test_helper().await;
 
         let alice = alice_id();
         let alice_device = alice_device_id();
@@ -2605,25 +2794,26 @@ pub(crate) mod tests {
         key_id: OwnedDeviceKeyId,
         one_time_key: Raw<OneTimeKey>,
     ) {
-        let keys = BTreeMap::from([(key_id, one_time_key)]);
-        let keys = BTreeMap::from([(device_id.to_owned(), keys)]);
-        let one_time_keys = BTreeMap::from([(user_id.to_owned(), keys)]);
-        let response = claim_keys::v3::Response::new(one_time_keys);
+        let one_time_keys = BTreeMap::from([(
+            user_id.to_owned(),
+            BTreeMap::from([(device_id.to_owned(), BTreeMap::from([(key_id, one_time_key)]))]),
+        )]);
 
-        machine.receive_keys_claim_response(&response).await.unwrap();
+        let response = claim_keys::v3::Response::new(one_time_keys);
+        machine.inner.session_manager.create_sessions(&response).await.unwrap();
     }
 
     #[async_test]
     async fn test_session_creation() {
         let (alice_machine, bob_machine, mut one_time_keys) =
             get_machine_pair(alice_id(), user_id(), false).await;
-        let (device_key_id, one_time_key) = one_time_keys.pop_first().unwrap();
+        let (key_id, one_time_key) = one_time_keys.pop_first().unwrap();
 
         create_session(
             &alice_machine,
             bob_machine.user_id(),
             bob_machine.device_id(),
-            device_key_id,
+            key_id,
             one_time_key,
         )
         .await;
@@ -2631,7 +2821,7 @@ pub(crate) mod tests {
         let session = alice_machine
             .store()
             .get_sessions(
-                &bob_machine.account().await.unwrap().identity_keys().curve25519.to_base64(),
+                &bob_machine.store().static_account().identity_keys().curve25519.to_base64(),
             )
             .await
             .unwrap()
@@ -2641,10 +2831,10 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn getting_most_recent_session() {
+    async fn test_getting_most_recent_session() {
         let (alice_machine, bob_machine, mut one_time_keys) =
             get_machine_pair(alice_id(), user_id(), false).await;
-        let (device_key_id, one_time_key) = one_time_keys.pop_first().unwrap();
+        let (key_id, one_time_key) = one_time_keys.pop_first().unwrap();
 
         let device = alice_machine
             .get_device(bob_machine.user_id(), bob_machine.device_id(), None)
@@ -2658,19 +2848,19 @@ pub(crate) mod tests {
             &alice_machine,
             bob_machine.user_id(),
             bob_machine.device_id(),
-            device_key_id,
+            key_id,
             one_time_key.to_owned(),
         )
         .await;
 
         for _ in 0..10 {
-            let (device_key_id, one_time_key) = one_time_keys.pop_first().unwrap();
+            let (key_id, one_time_key) = one_time_keys.pop_first().unwrap();
 
             create_session(
                 &alice_machine,
                 bob_machine.user_id(),
                 bob_machine.device_id(),
-                device_key_id,
+                key_id,
                 one_time_key.to_owned(),
             )
             .await;
@@ -2723,7 +2913,7 @@ pub(crate) mod tests {
             alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
 
         let (_, content) = bob_device
-            .encrypt("m.dummy", serde_json::to_value(ToDeviceDummyEventContent::new()).unwrap())
+            .encrypt("m.dummy", ToDeviceDummyEventContent::new())
             .await
             .expect("We should be able to encrypt a dummy event.");
 
@@ -2749,7 +2939,7 @@ pub(crate) mod tests {
             .deserialize()
             .expect("We should be able to deserialize the decrypted event.");
 
-        let decrypted = assert_matches!(decrypted, AnyToDeviceEvent::Dummy(decrypted) => decrypted);
+        assert_let!(AnyToDeviceEvent::Dummy(decrypted) = decrypted);
         assert_eq!(&decrypted.sender, alice.user_id());
 
         // Replaying the event should now result in a decryption failure.
@@ -2766,12 +2956,12 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn olm_encryption() {
+    async fn test_olm_encryption() {
         olm_encryption_test_helper(false).await;
     }
 
     #[async_test]
-    async fn olm_encryption_with_fallback_key() {
+    async fn test_olm_encryption_with_fallback_key() {
         olm_encryption_test_helper(true).await;
     }
 
@@ -2846,11 +3036,7 @@ pub(crate) mod tests {
             })
             .collect_vec();
 
-        if cfg!(feature = "backups_v1") {
-            assert_eq!(outgoing_to_device.len(), 4);
-        } else {
-            assert_eq!(outgoing_to_device.len(), 3);
-        }
+        assert_eq!(outgoing_to_device.len(), 4);
 
         // The second time, as there are already in-flight requests, it should have no
         // effect.
@@ -2863,29 +3049,25 @@ pub(crate) mod tests {
     async fn test_request_missing_secrets_cross_signed() {
         let (alice, bob) = get_machine_pair_with_session(alice_id(), bob_id(), false).await;
 
-        setup_cross_signing_for_machine(&alice, &bob).await;
+        setup_cross_signing_for_machine_test_helper(&alice, &bob).await;
 
         let should_query_secrets = alice.query_missing_secrets_from_other_sessions().await.unwrap();
 
-        if cfg!(feature = "backups_v1") {
-            assert!(should_query_secrets);
+        assert!(should_query_secrets);
 
-            let outgoing_to_device = alice
-                .outgoing_requests()
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|outgoing| match outgoing.request.as_ref() {
-                    OutgoingRequests::ToDeviceRequest(request) => {
-                        request.event_type.to_string() == "m.secret.request"
-                    }
-                    _ => false,
-                })
-                .collect_vec();
-            assert_eq!(outgoing_to_device.len(), 1);
-        } else {
-            assert!(!should_query_secrets);
-        }
+        let outgoing_to_device = alice
+            .outgoing_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|outgoing| match outgoing.request.as_ref() {
+                OutgoingRequests::ToDeviceRequest(request) => {
+                    request.event_type.to_string() == "m.secret.request"
+                }
+                _ => false,
+            })
+            .collect_vec();
+        assert_eq!(outgoing_to_device.len(), 1);
 
         // The second time, as there are already in-flight requests, it should have no
         // effect.
@@ -3140,7 +3322,7 @@ pub(crate) mod tests {
         );
         assert_shield!(encryption_info, Red, Red);
 
-        setup_cross_signing_for_machine(&alice, &bob).await;
+        setup_cross_signing_for_machine_test_helper(&alice, &bob).await;
         let bob_id_from_alice = alice.get_identity(bob.user_id(), None).await.unwrap();
         assert_matches!(bob_id_from_alice, Some(UserIdentities::Other(_)));
         let alice_id_from_bob = bob.get_identity(alice.user_id(), None).await.unwrap();
@@ -3221,11 +3403,11 @@ pub(crate) mod tests {
         );
     }
 
-    async fn setup_cross_signing_for_machine(alice: &OlmMachine, bob: &OlmMachine) {
-        let (alice_upload_signing, _) =
+    async fn setup_cross_signing_for_machine_test_helper(alice: &OlmMachine, bob: &OlmMachine) {
+        let CrossSigningBootstrapRequests { upload_signing_keys_req: alice_upload_signing, .. } =
             alice.bootstrap_cross_signing(false).await.expect("Expect Alice x-signing key request");
 
-        let (bob_upload_signing, _) =
+        let CrossSigningBootstrapRequests { upload_signing_keys_req: bob_upload_signing, .. } =
             bob.bootstrap_cross_signing(false).await.expect("Expect Bob x-signing key request");
 
         let bob_device_keys = bob
@@ -3268,15 +3450,18 @@ pub(crate) mod tests {
         );
 
         let kq_response = KeyQueryResponse::try_from_http_response(response_from_file(&json))
-            .expect("Can't parse the keys upload response");
+            .expect("Can't parse the `/keys/upload` response");
 
         alice.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
         bob.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
     }
 
     async fn sign_alice_device_for_machine_test_helper(alice: &OlmMachine, bob: &OlmMachine) {
-        let (upload_signing, upload_signature) =
-            alice.bootstrap_cross_signing(false).await.expect("Expect Alice x-signing key request");
+        let CrossSigningBootstrapRequests {
+            upload_signing_keys_req: upload_signing,
+            upload_signatures_req: upload_signature,
+            ..
+        } = alice.bootstrap_cross_signing(false).await.expect("Expect Alice x-signing key request");
 
         let mut device_keys = alice
             .get_device(alice.user_id(), alice.device_id(), None)
@@ -3333,7 +3518,7 @@ pub(crate) mod tests {
         );
 
         let kq_response = KeyQueryResponse::try_from_http_response(response_from_file(&json))
-            .expect("Can't parse the keys upload response");
+            .expect("Can't parse the `/keys/upload` response");
 
         alice.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
         bob.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
@@ -3356,7 +3541,7 @@ pub(crate) mod tests {
             .bootstrap_cross_signing(false)
             .await
             .expect("Expect Alice x-signing key request")
-            .0
+            .upload_signing_keys_req
             .user_signing_key
             .unwrap()
             .get_first_key_and_id()
@@ -3378,7 +3563,7 @@ pub(crate) mod tests {
             .bootstrap_cross_signing(false)
             .await
             .expect("Expect Alice x-signing key request")
-            .0;
+            .upload_signing_keys_req;
 
         let json = json!({
             "device_keys": {
@@ -3398,7 +3583,7 @@ pub(crate) mod tests {
         );
 
         let kq_response = KeyQueryResponse::try_from_http_response(response_from_file(&json))
-            .expect("Can't parse the keys upload response");
+            .expect("Can't parse the `/keys/upload` response");
 
         alice.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
         bob.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
@@ -3423,7 +3608,7 @@ pub(crate) mod tests {
 
         let data = response_from_file(&test_json::KEYS_QUERY_TWO_DEVICES_ONE_SIGNED);
         let response = get_keys::v3::Response::try_from_http_response(data)
-            .expect("Can't parse the keys upload response");
+            .expect("Can't parse the `/keys/upload` response");
 
         let (device_change, identity_change) =
             bob.receive_keys_query_response(&TransactionId::new(), &response).await.unwrap();
@@ -3504,7 +3689,7 @@ pub(crate) mod tests {
             .expect("should exist")
             .set_trust_state(crate::LocalTrust::Verified);
 
-        alice.create_outbound_group_session_with_defaults(room_id).await.unwrap();
+        alice.create_outbound_group_session_with_defaults_test_helper(room_id).await.unwrap();
 
         let plaintext = "It is a secret to everybody";
 
@@ -3565,7 +3750,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn interactive_verification() {
+    async fn test_interactive_verification() {
         let (alice, bob) =
             get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
 
@@ -3643,7 +3828,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn interactive_verification_started_from_request() {
+    async fn test_interactive_verification_started_from_request() {
         let (alice, bob) =
             get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
 
@@ -3721,7 +3906,7 @@ pub(crate) mod tests {
         // Alice sends a key
         let msgs = alice.inner.verification_machine.outgoing_messages();
         assert!(msgs.len() == 1);
-        let msg = msgs.first().unwrap();
+        let msg = &msgs[0];
         let event = outgoing_request_to_event(alice.user_id(), msg);
         alice.inner.verification_machine.mark_request_as_sent(&msg.request_id);
 
@@ -3734,7 +3919,7 @@ pub(crate) mod tests {
         // Now bob sends a key
         let msgs = bob.inner.verification_machine.outgoing_messages();
         assert!(msgs.len() == 1);
-        let msg = msgs.first().unwrap();
+        let msg = &msgs[0];
         let event = outgoing_request_to_event(bob.user_id(), msg);
         bob.inner.verification_machine.mark_request_as_sent(&msg.request_id);
 
@@ -3847,16 +4032,15 @@ pub(crate) mod tests {
         let session_key = group_session.session_key();
         let session_id = group_session.session_id();
 
-        let content = json!({
+        let content = message_like_event_content!({
             "algorithm": "m.megolm.v1.aes-sha2",
             "room_id": room_id,
             "session_id": session_id,
             "session_key": session_key.to_base64(),
-
         });
 
         let encrypted_content =
-            alice.encrypt_room_event_raw(room_id, content, "m.room_key").await.unwrap();
+            alice.encrypt_room_event_raw(room_id, "m.room_key", &content).await.unwrap();
         let event = json!({
             "sender": alice.user_id(),
             "content": encrypted_content,
@@ -3917,8 +4101,8 @@ pub(crate) mod tests {
         let signing_keys = SigningKeys::from([(DeviceKeyAlgorithm::Ed25519, fake_key)]);
         inbound.creator_info.signing_keys = signing_keys.into();
 
-        let content = json!({});
-        let content = outbound.encrypt(content, "m.dummy").await;
+        let content = message_like_event_content!({});
+        let content = outbound.encrypt("m.dummy", &content).await;
         alice.store().save_inbound_group_sessions(&[inbound]).await.unwrap();
 
         let event = json!({
@@ -3961,7 +4145,7 @@ pub(crate) mod tests {
 
         let (alice, bob) =
             get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
-        setup_cross_signing_for_machine(&alice, &bob).await;
+        setup_cross_signing_for_machine_test_helper(&alice, &bob).await;
 
         let second_alice = create_additional_machine(&alice).await;
 
@@ -4023,5 +4207,241 @@ pub(crate) mod tests {
             !identity.is_verified(),
             "Our identity should not be verified when there's a mismatch in the cross-signing keys"
         );
+    }
+
+    #[async_test]
+    async fn test_wait_on_key_query_doesnt_block_store() {
+        // Waiting for a key query shouldn't delay other write attempts to the store.
+        // This test will end immediately if it works, and times out after a few seconds
+        // if it failed.
+
+        let machine = OlmMachine::new(bob_id(), bob_device_id()).await;
+
+        // Mark Alice as a tracked user, so it gets into the groups of users for which
+        // we need to query keys.
+        machine.update_tracked_users([alice_id()]).await.unwrap();
+
+        // Start a background task that will wait for the key query to finish silently
+        // in the background.
+        let machine_cloned = machine.clone();
+        let wait = tokio::spawn(async move {
+            let machine = machine_cloned;
+            let user_devices =
+                machine.get_user_devices(alice_id(), Some(Duration::from_secs(10))).await.unwrap();
+            assert!(user_devices.devices().next().is_some());
+        });
+
+        // Let the background task work first.
+        tokio::task::yield_now().await;
+
+        // Create a key upload request and process it back immediately.
+        let requests = machine.bootstrap_cross_signing(false).await.unwrap();
+
+        let req = requests.upload_keys_req.expect("upload keys request should be there");
+        let response = keys_upload_response();
+        let mark_request_as_sent = machine.mark_request_as_sent(&req.request_id, &response);
+        tokio::time::timeout(Duration::from_secs(5), mark_request_as_sent)
+            .await
+            .expect("no timeout")
+            .expect("the underlying request has been marked as sent");
+
+        // Answer the key query, so the background task completes immediately?
+        let response = keys_query_response();
+        let key_queries = machine.inner.identity_manager.users_for_key_query().await.unwrap();
+
+        for (id, _) in key_queries {
+            machine.mark_request_as_sent(&id, &response).await.unwrap();
+        }
+
+        // The waiting should successfully complete.
+        wait.await.unwrap();
+    }
+
+    #[async_test]
+    async fn room_settings_returns_none_for_unknown_room() {
+        let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+        let settings = machine.room_settings(room_id!("!test2:localhost")).await.unwrap();
+        assert!(settings.is_none());
+    }
+
+    #[async_test]
+    async fn stores_and_returns_room_settings() {
+        let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+        let room_id = room_id!("!test:localhost");
+
+        let settings = RoomSettings {
+            algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2,
+            only_allow_trusted_devices: true,
+            session_rotation_period: Some(Duration::from_secs(10)),
+            session_rotation_period_messages: Some(1234),
+        };
+
+        machine.set_room_settings(room_id, &settings).await.unwrap();
+        assert_eq!(machine.room_settings(room_id).await.unwrap(), Some(settings));
+    }
+
+    #[async_test]
+    async fn set_room_settings_rejects_invalid_algorithms() {
+        let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+        let room_id = room_id!("!test:localhost");
+
+        let err = machine
+            .set_room_settings(
+                room_id,
+                &RoomSettings {
+                    algorithm: EventEncryptionAlgorithm::OlmV1Curve25519AesSha2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(err, SetRoomSettingsError::InvalidSettings)
+    }
+
+    #[async_test]
+    async fn set_room_settings_rejects_changes() {
+        let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+        let room_id = room_id!("!test:localhost");
+
+        // Initial settings
+        machine
+            .set_room_settings(
+                room_id,
+                &RoomSettings { session_rotation_period_messages: Some(100), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        // Now, modifying the settings should be rejected
+        let err = machine
+            .set_room_settings(
+                room_id,
+                &RoomSettings {
+                    session_rotation_period_messages: Some(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, SetRoomSettingsError::EncryptionDowngrade);
+    }
+
+    #[async_test]
+    async fn set_room_settings_accepts_noop_changes() {
+        let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+        let room_id = room_id!("!test:localhost");
+
+        // Initial settings
+        machine
+            .set_room_settings(
+                room_id,
+                &RoomSettings { session_rotation_period_messages: Some(100), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        // Same again; should be fine.
+        machine
+            .set_room_settings(
+                room_id,
+                &RoomSettings { session_rotation_period_messages: Some(100), ..Default::default() },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[async_test]
+    async fn test_send_encrypted_to_device() {
+        let (alice, bob) = get_machine_pair_with_session(alice_id(), user_id(), false).await;
+
+        let custom_event_type = "m.new_device";
+
+        let custom_content = json!({
+                "device_id": "XYZABCDE",
+                "rooms": ["!726s6s6q:example.com"]
+        });
+
+        let device = alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
+        let raw_encrypted = device
+            .encrypt_event_raw(custom_event_type, &custom_content)
+            .await
+            .expect("Should have encryted the content");
+
+        let request = ToDeviceRequest::new(
+            bob.user_id(),
+            DeviceIdOrAllDevices::DeviceId(bob_device_id().to_owned()),
+            "m.room.encrypted",
+            raw_encrypted.cast(),
+        );
+
+        assert_eq!("m.room.encrypted", request.event_type.to_string());
+
+        let messages = &request.messages;
+        assert_eq!(1, messages.len());
+        assert!(messages.get(bob.user_id()).is_some());
+        let target_devices = messages.get(bob.user_id()).unwrap();
+        assert_eq!(1, target_devices.len());
+        assert!(target_devices
+            .get(&DeviceIdOrAllDevices::DeviceId(bob_device_id().to_owned()))
+            .is_some());
+
+        let event = ToDeviceEvent::new(
+            alice.user_id().to_owned(),
+            to_device_requests_to_content(vec![request.clone().into()]),
+        );
+
+        let event = json_convert(&event).unwrap();
+
+        let sync_changes = EncryptionSyncChanges {
+            to_device_events: vec![event],
+            changed_devices: &Default::default(),
+            one_time_keys_counts: &Default::default(),
+            unused_fallback_keys: None,
+            next_batch_token: None,
+        };
+
+        let (decrypted, _) = bob.receive_sync_changes(sync_changes).await.unwrap();
+
+        assert_eq!(1, decrypted.len());
+
+        let decrypted_event = decrypted[0].deserialize().unwrap();
+
+        assert_eq!(decrypted_event.event_type().to_string(), custom_event_type.to_owned());
+
+        let decrypted_value = to_raw_value(&decrypted[0]).unwrap();
+        let decrypted_value = serde_json::to_value(decrypted_value).unwrap();
+
+        assert_eq!(
+            decrypted_value.get("content").unwrap().get("device_id").unwrap().as_str().unwrap(),
+            custom_content.get("device_id").unwrap().as_str().unwrap(),
+        );
+
+        assert_eq!(
+            decrypted_value.get("content").unwrap().get("rooms").unwrap().as_array().unwrap(),
+            custom_content.get("rooms").unwrap().as_array().unwrap(),
+        );
+    }
+
+    #[async_test]
+    async fn test_send_encrypted_to_device_no_session() {
+        let (alice, bob, _) = get_machine_pair(alice_id(), user_id(), false).await;
+
+        let custom_event_type = "m.new_device";
+
+        let custom_content = json!({
+                "device_id": "XYZABCDE",
+                "rooms": ["!726s6s6q:example.com"]
+        });
+
+        let encryption_result = alice
+            .get_device(bob.user_id(), bob_device_id(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .encrypt_event_raw(custom_event_type, &custom_content)
+            .await;
+
+        assert_matches!(encryption_result, Err(OlmError::MissingSession));
     }
 }

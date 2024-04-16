@@ -14,11 +14,11 @@
 // limitations under the License.
 #![cfg_attr(not(target_arch = "wasm32"), deny(clippy::future_not_send))]
 
-use std::{
-    future::{Future, IntoFuture},
-    pin::Pin,
-};
+#[cfg(feature = "sso-login")]
+use std::future::Future;
+use std::future::IntoFuture;
 
+use matrix_sdk_common::boxed_into_future;
 use ruma::{
     api::client::{session::login, uiaa::UserIdentifier},
     assign,
@@ -174,14 +174,22 @@ impl LoginBuilder {
         let homeserver = client.homeserver();
         info!(homeserver = homeserver.as_str(), identifier = ?self.login_method.id(), "Logging in");
 
-        let request = assign!(login::v3::Request::new(self.login_method.into_login_info()), {
+        let login_info = self.login_method.into_login_info();
+
+        let request = assign!(login::v3::Request::new(login_info.clone()), {
             device_id: self.device_id.map(Into::into),
             initial_device_display_name: self.initial_device_display_name,
             refresh_token: self.request_refresh_token,
         });
 
         let response = client.send(request, Some(RequestConfig::short_retry())).await?;
-        self.auth.receive_login_response(&response).await?;
+        self.auth
+            .receive_login_response(
+                &response,
+                #[cfg(feature = "e2e-encryption")]
+                Some(login_info),
+            )
+            .await?;
 
         Ok(response)
     }
@@ -189,8 +197,7 @@ impl LoginBuilder {
 
 impl IntoFuture for LoginBuilder {
     type Output = Result<login::v3::Response>;
-    // TODO: Use impl Trait once allowed in this position on stable
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())
@@ -456,8 +463,7 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     type Output = Result<login::v3::Response>;
-    // TODO: Use impl Trait once allowed in this position on stable
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())

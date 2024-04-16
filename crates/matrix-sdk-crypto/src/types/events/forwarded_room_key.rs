@@ -184,6 +184,7 @@ pub struct UnknownRoomKeyContent {
     other: BTreeMap<String, Value>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for ForwardedMegolmV1AesSha2Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForwardedMegolmV1AesSha2Content")
@@ -197,6 +198,7 @@ impl std::fmt::Debug for ForwardedMegolmV1AesSha2Content {
     }
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for ForwardedMegolmV2AesSha2Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForwardedMegolmV2AesSha2Content")
