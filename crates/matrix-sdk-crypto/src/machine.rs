@@ -37,8 +37,7 @@ use ruma::{
     assign,
     events::{
         room::history_visibility::HistoryVisibility, secret::request::SecretName,
-        AnyMessageLikeEvent, AnyMessageLikeEventContent, AnyToDeviceEvent,
-        MessageLikeEventContent,
+        AnyMessageLikeEvent, AnyMessageLikeEventContent, AnyToDeviceEvent, MessageLikeEventContent,
     },
     serde::Raw,
     DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedDeviceKeyId,
@@ -994,7 +993,7 @@ impl OlmMachine {
 
                 let mut devices = Vec::new();
                 for user_id in users {
-                    let user_devices = self.store().get_user_devices_filtered(user_id).await?;
+                    let user_devices = self.store().get_user_devices(user_id).await?;
 
                     let valid_devices: Vec<Device> = user_devices
                         .devices()
@@ -1024,7 +1023,7 @@ impl OlmMachine {
                         let info = MegolmV1AesSha2Content {
                             room_id: room_id.to_owned(),
                             sender_key: session.sender_key(),
-                            session_id: session.session_id().to_string(),
+                            session_id: session.session_id().to_owned(),
                         };
                         let content = RoomKeyRequestContent::new_request(
                             RequestedKeyInfo::MegolmV1AesSha2(info),

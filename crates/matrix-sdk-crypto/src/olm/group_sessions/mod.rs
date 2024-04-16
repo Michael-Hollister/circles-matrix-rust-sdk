@@ -115,6 +115,7 @@ impl ExportedRoomKey {
             session_key: room_key.session_key,
             sender_claimed_keys: room_key.sender_claimed_keys,
             forwarding_curve25519_key_chain: room_key.forwarding_curve25519_key_chain,
+            shared_history: room_key.shared_history,
         }
     }
 }

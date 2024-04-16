@@ -455,7 +455,7 @@ impl GossipMachine {
             .unwrap()
             .entry(device.device_id().to_owned())
             .or_default()
-            .insert(session.session_id().to_string());
+            .insert(session.session_id().to_owned());
 
         let outbound_session =
             self.inner.outbound_group_sessions.get_or_load(session.room_id()).await;
@@ -727,14 +727,14 @@ impl GossipMachine {
             }
         }
 
-        let outbound_session = if use_current_session {
-            self.inner.outbound_group_sessions.get_or_load(session.room_id()).await
-        } else {
-            self.inner
-                .outbound_group_sessions
-                .get_with_id(session.room_id(), session.session_id())
-                .await
-        };
+        let outbound_session =
+            if use_current_session {
+                self.inner.outbound_group_sessions.get_or_load(session.room_id()).await
+            } else {
+                self.inner.outbound_group_sessions.get_or_load(session.room_id()).await.filter(
+                    |outgoing_session| outgoing_session.session_id() == session.session_id(),
+                )
+            };
 
         // If this is our own, verified device, we share the entire session from the
         // earliest known index.
@@ -1708,6 +1708,8 @@ mod tests {
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn test_should_share_key() {
+        use ruma::events::room::history_visibility::HistoryVisibility;
+
         let machine = get_machine_test_helper().await;
         let account = account();
 

@@ -100,8 +100,7 @@ impl SessionManager {
 
     /// Generates a `m.dummy` to-device request
     pub async fn generate_dummy_request(&self, device: crate::Device) -> OlmResult<()> {
-        let (_, content) =
-            device.encrypt("m.dummy", ToDeviceDummyEventContent::new()).await?;
+        let (_, content) = device.encrypt("m.dummy", ToDeviceDummyEventContent::new()).await?;
 
         let request = ToDeviceRequest::new(
             device.user_id(),
