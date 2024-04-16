@@ -897,8 +897,18 @@ impl OlmMachine {
                 HistoryVisibility::Shared | HistoryVisibility::WorldReadable
             ) {
                 let all_sessions = self.store().get_inbound_group_sessions().await?;
-                let room_sessions: Vec<InboundGroupSession> =
-                    all_sessions.into_iter().filter(|s| s.room_id == room_id).collect();
+                let room_sessions: Vec<InboundGroupSession> = all_sessions
+                    .into_iter()
+                    .filter(|s| {
+                        s.room_id == room_id
+                            && s.history_visibility.as_ref().clone().is_some_and(|h| {
+                                matches!(
+                                    h,
+                                    HistoryVisibility::Shared | HistoryVisibility::WorldReadable
+                                )
+                            })
+                    })
+                    .collect();
 
                 let mut devices = Vec::new();
                 for user_id in users {
@@ -917,45 +927,41 @@ impl OlmMachine {
                     devices.extend(valid_devices);
                 }
 
-                for session in &room_sessions {
-                    if let Some(history) = session.history_visibility.as_ref().clone() {
-                        if matches!(
-                            history,
-                            HistoryVisibility::Shared | HistoryVisibility::WorldReadable
-                        ) {
-                            for device in &devices {
-                                let info = MegolmV1AesSha2Content {
-                                    room_id: room_id.to_owned(),
-                                    sender_key: session.sender_key(),
-                                    session_id: session.session_id().to_string(),
-                                };
-                                let content = RoomKeyRequestContent::new_request(
-                                    RequestedKeyInfo::MegolmV1AesSha2(info),
-                                    device.device_id().to_owned(),
-                                    ruma::TransactionId::new(),
-                                );
-                                let event =
-                                    RoomKeyRequestEvent::new(device.user_id().to_owned(), content);
+                // Key forwarding process:
+                // 1. Establish a new Olm session with each device, regardless if there is an
+                //    existing session (`generate_dummy_request`). This is to prevent potential
+                //    session wedging when forwarding keys within an existing session.
+                // 2. Queue keys to be shared and sent out claim request
+                //    (`forward_room_history_key`).
+                // 3. Share keys after Olm session is established when processing key claim
+                //    response (`retry_keyshare`).
+                for device in &devices {
+                    self.inner.session_manager.generate_dummy_request(device.clone()).await?;
 
-                                match self
-                                    .inner
-                                    .key_request_machine
-                                    .try_to_forward_room_key(
-                                        &event,
-                                        device.to_owned(),
-                                        session,
-                                        None,
-                                        true,
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => {}
-                                    Err(e) => warn!(
-                                        "Error forwarding room keys to device {:?}: {e}",
-                                        device.device_id()
-                                    ),
-                                }
-                            }
+                    for session in &room_sessions {
+                        let info = MegolmV1AesSha2Content {
+                            room_id: room_id.to_owned(),
+                            sender_key: session.sender_key(),
+                            session_id: session.session_id().to_string(),
+                        };
+                        let content = RoomKeyRequestContent::new_request(
+                            RequestedKeyInfo::MegolmV1AesSha2(info),
+                            device.device_id().to_owned(),
+                            ruma::TransactionId::new(),
+                        );
+                        let event = RoomKeyRequestEvent::new(device.user_id().to_owned(), content);
+
+                        match self
+                            .inner
+                            .key_request_machine
+                            .forward_room_history_key(&event, device.to_owned(), session)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                "Error forwarding room keys to device {:?}: {e}",
+                                device.device_id()
+                            ),
                         }
                     }
                 }
