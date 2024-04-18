@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM docker.io/rust:1.74.0-slim-bookworm
+FROM docker.io/rust:1.76.0-slim-bookworm
 RUN apt-get update && apt-get -y --no-install-recommends install \
     pkg-config \
     libssl-dev \
@@ -24,7 +24,7 @@ RUN rustup target add \
     i686-linux-android
 RUN cargo install cargo-ndk
 
-# Envrionment setup
+# Environment setup
 ENV ANDROID_NDK=/root/Android/Sdk/ndk/$ANDROID_NDK_VERSION
 ENV ANDROID_NDK_HOME=/root/Android/Sdk/ndk/$ANDROID_NDK_VERSION
 ENV ANDROID_HOME=/root/Android/Sdk/ndk/$ANDROID_NDK_VERSION
