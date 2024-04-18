@@ -81,6 +81,31 @@ impl SessionManager {
         self.outgoing_to_device_requests.write().unwrap().remove(id);
     }
 
+    /// Generates a `m.dummy` to-device request
+    pub async fn generate_dummy_request(&self, device: crate::Device) -> OlmResult<()> {
+        let content = serde_json::to_value(ToDeviceDummyEventContent::new())?;
+        let (_, content) = device.encrypt("m.dummy", content).await?;
+
+        let request = ToDeviceRequest::new(
+            device.user_id(),
+            device.device_id().to_owned(),
+            content.event_type(),
+            content.cast(),
+        );
+
+        let request = OutgoingRequest {
+            request_id: request.txn_id.clone(),
+            request: Arc::new(request.into()),
+        };
+
+        self.outgoing_to_device_requests
+            .write()
+            .unwrap()
+            .insert(request.request_id.clone(), request);
+
+        Ok(())
+    }
+
     pub async fn mark_device_as_wedged(
         &self,
         sender: &UserId,
@@ -148,25 +173,7 @@ impl SessionManager {
             .is_some_and(|d| d.remove(device_id))
         {
             if let Some(device) = self.store.get_device(user_id, device_id).await? {
-                let content = serde_json::to_value(ToDeviceDummyEventContent::new())?;
-                let (_, content) = device.encrypt("m.dummy", content).await?;
-
-                let request = ToDeviceRequest::new(
-                    device.user_id(),
-                    device.device_id().to_owned(),
-                    content.event_type(),
-                    content.cast(),
-                );
-
-                let request = OutgoingRequest {
-                    request_id: request.txn_id.clone(),
-                    request: Arc::new(request.into()),
-                };
-
-                self.outgoing_to_device_requests
-                    .write()
-                    .unwrap()
-                    .insert(request.request_id.clone(), request);
+                self.generate_dummy_request(device).await?;
             }
         }
 

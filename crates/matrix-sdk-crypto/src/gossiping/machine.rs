@@ -362,15 +362,13 @@ impl GossipMachine {
     /// `/keys/claim` request to be sent out and retry once the 1-to-1 Olm
     /// session has been established.
     #[cfg(feature = "automatic-room-key-forwarding")]
-    pub async fn try_to_forward_room_key(
+    async fn try_to_forward_room_key(
         &self,
         event: &RoomKeyRequestEvent,
         device: Device,
         session: &InboundGroupSession,
         message_index: Option<u32>,
-        update_outbound_devices: bool,
     ) -> OlmResult<Option<Session>> {
-        use crate::olm::{ShareInfo, ShareState};
         info!(?message_index, "Serving a room key request",);
 
         match self.forward_room_key(session, &device, message_index).await {
@@ -379,49 +377,6 @@ impl GossipMachine {
                 info!(
                     "Key request is missing an Olm session, putting the request in the wait queue",
                 );
-
-                // In the case when we are inviting a user that has a device
-                // with a missing session, we need to ensure that we allow the
-                // forwarded key to be in the outbound session's
-                // `shared_with_set` when the olm session is established
-                if update_outbound_devices {
-                    self.inner
-                        .pending_room_key_forwarding_devices
-                        .write()
-                        .unwrap()
-                        .entry(device.device_id().to_owned())
-                        .or_default()
-                        .insert(session.session_id().to_string());
-
-                    let outbound_session =
-                        self.inner.outbound_group_sessions.get_or_load(session.room_id()).await;
-
-                    if let Some(outbound) = outbound_session {
-                        match outbound.is_shared_with(&device) {
-                            ShareState::NotShared => {
-                                let share_info = ShareInfo::new_shared(
-                                    device.curve25519_key().unwrap(),
-                                    outbound.message_index().await,
-                                );
-                                outbound
-                                    .shared_with_set
-                                    .write()
-                                    .unwrap()
-                                    .entry(device.user_id().to_owned())
-                                    .or_default()
-                                    .insert(device.device_id().to_owned(), share_info);
-
-                                self.inner.outbound_group_sessions.insert(outbound.clone());
-
-                                let mut changes = Changes::default();
-                                changes.outbound_group_sessions.push(outbound);
-                                self.inner.store.save_changes(changes).await?;
-                            }
-                            ShareState::SharedButChangedSenderKey | ShareState::Shared(_) => {}
-                        }
-                    }
-                }
-
                 self.handle_key_share_without_session(device, event.to_owned().into());
 
                 Ok(None)
@@ -435,6 +390,65 @@ impl GossipMachine {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Queues up an `/keys/claim` request to be sent out and forwards the key
+    /// after the Olm session is established.
+    #[cfg(feature = "automatic-room-key-forwarding")]
+    pub async fn forward_room_history_key(
+        &self,
+        event: &RoomKeyRequestEvent,
+        device: Device,
+        session: &InboundGroupSession,
+    ) -> OlmResult<Option<Session>> {
+        use crate::olm::{ShareInfo, ShareState};
+        info!("Forwarding historical room key");
+
+        // In the case when we are inviting a user that has a device
+        // with a missing session, we need to ensure that we allow the
+        // forwarded key to be in the outbound session's
+        // `shared_with_set` when the olm session is established
+        self.inner
+            .pending_room_key_forwarding_devices
+            .write()
+            .unwrap()
+            .entry(device.device_id().to_owned())
+            .or_default()
+            .insert(session.session_id().to_string());
+
+        let outbound_session =
+            self.inner.outbound_group_sessions.get_or_load(session.room_id()).await;
+
+        if let Some(outbound) = outbound_session {
+            match outbound.is_shared_with(&device) {
+                ShareState::NotShared => {
+                    let share_info = ShareInfo::new_shared(
+                        device.curve25519_key().unwrap(),
+                        outbound.message_index().await,
+                    );
+                    outbound
+                        .shared_with_set
+                        .write()
+                        .unwrap()
+                        .entry(device.user_id().to_owned())
+                        .or_default()
+                        .insert(device.device_id().to_owned(), share_info);
+
+                    self.inner.outbound_group_sessions.insert(outbound.clone());
+
+                    let mut changes = Changes::default();
+                    changes.outbound_group_sessions.push(outbound);
+                    self.inner.store.save_changes(changes).await?;
+                }
+                ShareState::SharedButChangedSenderKey | ShareState::Shared(_) => {}
+            }
+
+            self.handle_key_share_without_session(device, event.to_owned().into());
+        } else {
+            warn!("Could not get outbound group session to forward room key");
+        }
+
+        Ok(None)
     }
 
     /// Answer a room key request after we found the matching
@@ -459,7 +473,7 @@ impl GossipMachine {
 
         match self.should_share_key(&device, session).await {
             Ok(message_index) => {
-                self.try_to_forward_room_key(event, device, session, message_index, false).await
+                self.try_to_forward_room_key(event, device, session, message_index).await
             }
             Err(e) => {
                 if let KeyForwardDecision::ChangedSenderKey = e {
