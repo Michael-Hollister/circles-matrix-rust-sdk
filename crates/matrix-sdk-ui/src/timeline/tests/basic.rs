@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use imbl::vector;
 use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB, CAROL};
 use ruma::{
@@ -34,19 +34,19 @@ use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
-    event_item::AnyOtherFullStateEventContent, MembershipChange, TimelineDetails,
-    TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
+    event_item::AnyOtherFullStateEventContent, inner::TimelineEnd, MembershipChange,
+    TimelineDetails, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
 };
 
 #[async_test]
-async fn initial_events() {
-    let mut timeline = TestTimeline::new();
+async fn test_initial_events() {
+    let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
     timeline
         .inner
-        .add_initial_events(
-            vector![
+        .add_events_at(
+            vec![
                 SyncTimelineEvent::new(
                     timeline
                         .event_builder
@@ -58,20 +58,22 @@ async fn initial_events() {
                         .make_sync_message_event(*BOB, RoomMessageEventContent::text_plain("B")),
                 ),
             ],
-            None,
+            TimelineEnd::Back { from_cache: false },
         )
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    assert_matches!(&item.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)));
-    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_eq!(item.as_event().unwrap().sender(), *ALICE);
+
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_eq!(item.as_event().unwrap().sender(), *BOB);
+
+    let item = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert_matches!(&item.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)));
 }
 
 #[async_test]
-async fn sticker() {
+async fn test_sticker() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
@@ -99,7 +101,7 @@ async fn sticker() {
 }
 
 #[async_test]
-async fn room_member() {
+async fn test_room_member() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
@@ -116,8 +118,7 @@ async fn room_member() {
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert!(item.can_be_replied_to());
-    let membership =
-        assert_matches!(item.content(), TimelineItemContent::MembershipChange(ev) => ev);
+    assert_let!(TimelineItemContent::MembershipChange(membership) = item.content());
     assert_matches!(membership.content(), FullStateEventContent::Original { .. });
     assert_matches!(membership.change(), Some(MembershipChange::Invited));
 
@@ -133,8 +134,7 @@ async fn room_member() {
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let membership =
-        assert_matches!(item.content(), TimelineItemContent::MembershipChange(ev) => ev);
+    assert_let!(TimelineItemContent::MembershipChange(membership) = item.content());
     assert_matches!(membership.content(), FullStateEventContent::Original { .. });
     assert_matches!(membership.change(), Some(MembershipChange::InvitationAccepted));
 
@@ -150,7 +150,7 @@ async fn room_member() {
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let profile = assert_matches!(item.content(), TimelineItemContent::ProfileChange(ev) => ev);
+    assert_let!(TimelineItemContent::ProfileChange(profile) = item.content());
     assert_matches!(profile.displayname_change(), Some(_));
     assert_matches!(profile.avatar_url_change(), None);
 
@@ -163,14 +163,13 @@ async fn room_member() {
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let membership =
-        assert_matches!(item.content(), TimelineItemContent::MembershipChange(ev) => ev);
+    assert_let!(TimelineItemContent::MembershipChange(membership) = item.content());
     assert_matches!(membership.content(), FullStateEventContent::Redacted(_));
     assert_matches!(membership.change(), None);
 }
 
 #[async_test]
-async fn other_state() {
+async fn test_other_state() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
@@ -178,27 +177,26 @@ async fn other_state() {
         .handle_live_state_event(&ALICE, RoomNameEventContent::new("Alice's room".to_owned()), None)
         .await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let ev = assert_matches!(item.as_event().unwrap().content(), TimelineItemContent::OtherState(ev) => ev);
-    let full_content =
-        assert_matches!(ev.content(), AnyOtherFullStateEventContent::RoomName(c) => c);
-    let (content, prev_content) = assert_matches!(full_content, FullStateEventContent::Original { content, prev_content } => (content, prev_content));
+    assert_let!(TimelineItemContent::OtherState(ev) = item.as_event().unwrap().content());
+    assert_let!(AnyOtherFullStateEventContent::RoomName(full_content) = ev.content());
+    assert_let!(FullStateEventContent::Original { content, prev_content } = full_content);
     assert_eq!(content.name, "Alice's room");
     assert_matches!(prev_content, None);
+
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
 
     timeline.handle_live_redacted_state_event(&ALICE, RedactedRoomTopicEventContent::new()).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let ev = assert_matches!(item.as_event().unwrap().content(), TimelineItemContent::OtherState(ev) => ev);
-    let full_content =
-        assert_matches!(ev.content(), AnyOtherFullStateEventContent::RoomTopic(c) => c);
+    assert_let!(TimelineItemContent::OtherState(ev) = item.as_event().unwrap().content());
+    assert_let!(AnyOtherFullStateEventContent::RoomTopic(full_content) = ev.content());
     assert_matches!(full_content, FullStateEventContent::Redacted(_));
 }
 
 #[async_test]
-async fn dedup_pagination() {
+async fn test_dedup_pagination() {
     let timeline = TestTimeline::new();
 
     let event = timeline
@@ -221,8 +219,8 @@ async fn dedup_pagination() {
 }
 
 #[async_test]
-async fn dedup_initial() {
-    let mut timeline = TestTimeline::new();
+async fn test_dedup_initial() {
+    let timeline = TestTimeline::new();
 
     let event_a = SyncTimelineEvent::new(
         timeline
@@ -242,8 +240,8 @@ async fn dedup_initial() {
 
     timeline
         .inner
-        .add_initial_events(
-            vector![
+        .add_events_at(
+            vec![
                 // two events
                 event_a.clone(),
                 event_b.clone(),
@@ -251,14 +249,15 @@ async fn dedup_initial() {
                 event_a,
                 event_b,
                 // … and a new event also came in
-                event_c
+                event_c,
             ],
-            None,
+            TimelineEnd::Back { from_cache: false },
         )
         .await;
 
     let timeline_items = timeline.inner.items().await;
     assert_eq!(timeline_items.len(), 4);
+
     assert!(timeline_items[0].is_day_divider());
 
     let event1 = &timeline_items[1];
@@ -271,13 +270,14 @@ async fn dedup_initial() {
     assert_eq!(event3.as_event().unwrap().sender(), *CAROL);
 
     // Make sure we reused IDs when deduplicating events
-    assert_eq!(event1.unique_id(), 1);
-    assert_eq!(event2.unique_id(), 2);
-    assert_eq!(event3.unique_id(), 3);
+    assert_eq!(event1.unique_id(), 0);
+    assert_eq!(event2.unique_id(), 1);
+    assert_eq!(event3.unique_id(), 2);
+    assert_eq!(timeline_items[0].unique_id(), 3);
 }
 
 #[async_test]
-async fn sanitized() {
+async fn test_sanitized() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
@@ -301,12 +301,10 @@ async fn sanitized() {
         )
         .await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event = item.as_event().unwrap();
-    let message = assert_matches!(event.content(), TimelineItemContent::Message(msg) => msg);
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(TimelineItemContent::Message(message) = event.content());
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(
         text.formatted.as_ref().unwrap().body,
         "\
@@ -315,10 +313,13 @@ async fn sanitized() {
             <code>Some code</code>\
         "
     );
+
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
 }
 
 #[async_test]
-async fn reply() {
+async fn test_reply() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
@@ -329,13 +330,14 @@ async fn reply() {
         )
         .await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
     assert!(first_event.can_be_replied_to());
     let first_event_id = first_event.event_id().unwrap();
     let first_event_sender = *ALICE;
+
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
 
     let reply_formatted_body = format!("\
         <mx-reply>\
@@ -361,20 +363,20 @@ async fn reply() {
     timeline.handle_live_message_event(&BOB, reply).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let message = assert_matches!(item.as_event().unwrap().content(), TimelineItemContent::Message(msg) => msg);
+    assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());
 
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "I'm replying!");
     assert_eq!(text.formatted.as_ref().unwrap().body, "<p>I'm replying!</p>");
 
     let in_reply_to = message.in_reply_to().unwrap();
     assert_eq!(in_reply_to.event_id, first_event_id);
-    let replied_to_event = assert_matches!(&in_reply_to.event, TimelineDetails::Ready(msg) => msg);
+    assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
     assert_eq!(replied_to_event.sender(), *ALICE);
 }
 
 #[async_test]
-async fn thread() {
+async fn test_thread() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
@@ -385,11 +387,12 @@ async fn thread() {
         )
         .await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
     let first_event_id = first_event.event_id().unwrap();
+
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
 
     let reply = assign!(RoomMessageEventContent::text_plain("I'm replying in a thread"), {
         relates_to: Some(Relation::Thread(
@@ -400,14 +403,14 @@ async fn thread() {
     timeline.handle_live_message_event(&BOB, reply).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let message = assert_matches!(item.as_event().unwrap().content(), TimelineItemContent::Message(msg) => msg);
+    assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());
 
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "I'm replying in a thread");
     assert_matches!(text.formatted, None);
 
     let in_reply_to = message.in_reply_to().unwrap();
     assert_eq!(in_reply_to.event_id, first_event_id);
-    let replied_to_event = assert_matches!(&in_reply_to.event, TimelineDetails::Ready(msg) => msg);
+    assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
     assert_eq!(replied_to_event.sender(), *ALICE);
 }

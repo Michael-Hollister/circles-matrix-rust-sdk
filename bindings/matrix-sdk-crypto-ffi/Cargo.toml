@@ -12,6 +12,10 @@ publish = false
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[[bin]]
+name = "matrix_sdk_crypto_ffi"
+path = "uniffi-bindgen.rs"
+
 [features]
 default = ["bundled-sqlite"]
 bundled-sqlite = ["matrix-sdk-sqlite/bundled"]
@@ -21,8 +25,9 @@ anyhow = { workspace = true }
 futures-util = "0.3.28"
 hmac = "0.12.1"
 http = { workspace = true }
+matrix-sdk-common = { workspace = true }
 pbkdf2 = "0.12.2"
-rand = "0.8.5"
+rand = { workspace = true }
 ruma = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,7 +35,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 # keep in sync with uniffi dependency in matrix-sdk-ffi, and uniffi_bindgen in ffi CI job
-uniffi = { workspace = true }
+uniffi = { workspace = true , features = ["cli"]}
 vodozemac = { workspace = true }
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 
@@ -38,20 +43,12 @@ zeroize = { workspace = true, features = ["zeroize_derive"] }
 version = "0.2.2"
 features = ["lax_deserialize"]
 
-[dependencies.matrix-sdk-common]
-path = "../../crates/matrix-sdk-common"
-version = "0.6.0"
-
 [dependencies.matrix-sdk-crypto]
-path = "../../crates/matrix-sdk-crypto"
-version = "0.6.0"
-default_features = false
-features = ["qrcode", "backups_v1", "automatic-room-key-forwarding"]
+workspace = true
+features = ["qrcode", "automatic-room-key-forwarding", "uniffi"]
 
 [dependencies.matrix-sdk-sqlite]
-path = "../../crates/matrix-sdk-sqlite"
-version = "0.1.0"
-default_features = false
+workspace = true
 features = ["crypto-store"]
 
 [dependencies.tokio]
@@ -60,9 +57,12 @@ default_features = false
 features = ["rt-multi-thread"]
 
 [build-dependencies]
-uniffi = { workspace = true, features = ["build"] }
 vergen = { version = "8.2.5", features = ["build", "git", "gitcl"] }
+uniffi = { workspace = true, features = ["build"] }
 
 [dev-dependencies]
 tempfile = "3.8.0"
-assert_matches = { workspace = true }
+assert_matches2 = { workspace = true }
+
+[lints]
+workspace = true

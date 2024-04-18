@@ -13,14 +13,15 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Deref,
     sync::Arc,
+    time::Duration,
 };
 
 use futures_util::future::join_all;
 use itertools::Itertools;
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{executor::spawn, failures_cache::FailuresCache};
 use ruma::{
     api::client::keys::get_keys::v3::Response as KeysQueryResponse, serde::Raw, OwnedDeviceId,
     OwnedServerName, OwnedTransactionId, OwnedUserId, ServerName, TransactionId, UserId,
@@ -36,12 +37,11 @@ use crate::{
     olm::PrivateCrossSigningIdentity,
     requests::KeysQueryRequest,
     store::{
-        caches::SequenceNumber, Changes, DeviceChanges, IdentityChanges, Result as StoreResult,
-        Store,
+        caches::SequenceNumber, Changes, DeviceChanges, IdentityChanges, KeyQueryManager,
+        Result as StoreResult, Store, StoreCache, UserKeyQueryResult,
     },
     types::{CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, UserSigningPubkey},
-    utilities::FailuresCache,
-    LocalTrust, SignatureError,
+    CryptoStoreError, LocalTrust, SignatureError,
 };
 
 enum DeviceChange {
@@ -61,8 +61,14 @@ enum IdentityUpdateResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct IdentityManager {
+    /// Servers that have previously appeared in the `failures` section of a
+    /// `/keys/query` response.
+    ///
+    /// See also [`crate::session_manager::SessionManager::failures`].
     failures: FailuresCache<OwnedServerName>,
     store: Store,
+
+    pub(crate) key_query_manager: Arc<KeyQueryManager>,
 
     /// Details of the current "in-flight" key query request, if any
     keys_query_request_details: Arc<Mutex<Option<KeysQueryRequestDetails>>>,
@@ -89,6 +95,7 @@ impl IdentityManager {
 
         IdentityManager {
             store,
+            key_query_manager: Default::default(),
             failures: Default::default(),
             keys_query_request_details: keys_query_request_details.into(),
         }
@@ -98,7 +105,7 @@ impl IdentityManager {
         &self.store.static_account().user_id
     }
 
-    /// Receive a successful keys query response.
+    /// Receive a successful `/keys/query` response.
     ///
     /// Returns a list of devices newly discovered devices and devices that
     /// changed.
@@ -107,7 +114,7 @@ impl IdentityManager {
     ///
     /// * `request_id` - The request_id returned by `users_for_key_query` or
     ///   `build_key_query_for_users`
-    /// * `response` - The keys query response of the request that the client
+    /// * `response` - The response of the `/keys/query` request that the client
     /// performed.
     pub async fn receive_keys_query_response(
         &self,
@@ -118,7 +125,7 @@ impl IdentityManager {
             ?request_id,
             users = ?response.device_keys.keys().collect::<BTreeSet<_>>(),
             failures = ?response.failures,
-            "Handling a keys query response"
+            "Handling a `/keys/query` response"
         );
 
         // Parse the strings into server names and filter out our own server. We should
@@ -166,7 +173,10 @@ impl IdentityManager {
         };
 
         if let Some(sequence_number) = sequence_number {
-            self.store
+            let cache = self.store.cache().await?;
+            self.key_query_manager
+                .synced(&cache)
+                .await?
                 .mark_tracked_users_as_up_to_date(
                     response.device_keys.keys().map(Deref::deref),
                     sequence_number,
@@ -203,7 +213,7 @@ impl IdentityManager {
             ?deleted_devices,
             ?new_identities,
             ?changed_identities,
-            "Finished handling of the keys/query response"
+            "Finished handling of the `/keys/query` response"
         );
 
         Ok((devices, identities))
@@ -219,8 +229,8 @@ impl IdentityManager {
         if let Some(mut device) = old_device {
             if let Err(e) = device.update_device(&device_keys) {
                 warn!(
-                    user_id = device.user_id().as_str(),
-                    device_id = device.device_id().as_str(),
+                    user_id = ?device.user_id(),
+                    device_id = ?device.device_id(),
                     error = ?e,
                     "Failed to update device keys",
                 );
@@ -242,8 +252,8 @@ impl IdentityManager {
                             d.set_trust_state(LocalTrust::Verified);
 
                             trace!(
-                                user_id = d.user_id().as_str(),
-                                device_id = d.device_id().as_str(),
+                                user_id = ?d.user_id(),
+                                device_id = ?d.device_id(),
                                 keys = ?d.keys(),
                                 "Adding our own device to the device store, \
                                 marking it as locally verified",
@@ -255,8 +265,8 @@ impl IdentityManager {
                         }
                     } else {
                         trace!(
-                            user_id = d.user_id().as_str(),
-                            device_id = d.device_id().as_str(),
+                            user_id = ?d.user_id(),
+                            device_id = ?d.device_id(),
                             keys = ?d.keys(),
                             "Adding a new device to the device store",
                         );
@@ -266,8 +276,8 @@ impl IdentityManager {
                 }
                 Err(e) => {
                     warn!(
-                        user_id = device_keys.user_id.as_str(),
-                        device_id = device_keys.device_id.as_str(),
+                        user_id = ?device_keys.user_id,
+                        device_id = ?device_keys.device_id,
                         error = ?e,
                         "Failed to create a new device",
                     );
@@ -295,10 +305,10 @@ impl IdentityManager {
             Ok(device_keys) => {
                 if user_id != device_keys.user_id || device_id != device_keys.device_id {
                     warn!(
-                        user_id = user_id.as_str(),
-                        device_id = device_id.as_str(),
-                        device_key_user = device_keys.user_id.as_str(),
-                        device_key_device_id = device_keys.device_id.as_str(),
+                        ?user_id,
+                        ?device_id,
+                        device_key_user = ?device_keys.user_id,
+                        device_key_device_id = ?device_keys.device_id,
                         "Mismatch in the device keys payload",
                     );
                     None
@@ -308,9 +318,7 @@ impl IdentityManager {
             }
             Err(e) => {
                 warn!(
-                    user_id = user_id.as_str(),
-                    device_id = device_id.as_str(),
-                    error = ?e,
+                    ?user_id, ?device_id, error = ?e,
                     "Device keys failed to deserialize",
                 );
                 None
@@ -340,8 +348,8 @@ impl IdentityManager {
                 let identity_keys = store.static_account().identity_keys();
 
                 warn!(
-                    user_id = own_user_id.as_str(),
-                    device_id = own_device_id.as_str(),
+                    user_id = ?own_user_id,
+                    device_id = ?own_device_id,
                     curve25519_key = ?identity_keys.curve25519,
                     ed25519_key = ?identity_keys.ed25519,
                     "Our own device might have been deleted"
@@ -388,12 +396,23 @@ impl IdentityManager {
         Ok(changes)
     }
 
-    /// Check if the given public identity matches our private one.
+    /// Check if the given public identity matches our stored private one.
     ///
-    /// If they don't match remove the private keys since our identity got
-    /// rotated.
+    /// If they don't match, this is an indication that our identity has been
+    /// rotated. In this case we return `Some(cleared_private_identity)`,
+    /// where `cleared_private_identity` is our currently-stored
+    /// private identity with the conflicting keys removed.
     ///
-    /// If they do match, mark the public identity as verified.
+    /// Otherwise, assuming we do have a private master cross-signing key, we
+    /// mark the public identity as verified.
+    ///
+    /// # Returns
+    ///
+    /// If the private identity needs updating (because it does not match the
+    /// public keys), the updated private identity (which will need to be
+    /// persisted).
+    ///
+    /// Otherwise, `None`.
     async fn check_private_identity(
         &self,
         identity: &ReadOnlyOwnUserIdentity,
@@ -421,6 +440,36 @@ impl IdentityManager {
         }
     }
 
+    /// Process an identity received in a `/keys/query` response that we
+    /// previously knew about.
+    ///
+    /// If the identity is our own, we will look for a user-signing key; if one
+    /// is not found, an error is returned. Otherwise, we then compare the
+    /// received public identity against our stored private identity;
+    /// if they match, the returned public identity is marked as verified and
+    /// `*changed_private_identity` is set to `None`. If they do *not* match,
+    /// it is an indication that our identity has been rotated, and
+    /// `*changed_private_identity` is set to our currently-stored private
+    /// identity with the conflicting keys removed (which will need to be
+    /// persisted).
+    ///
+    /// Whether the identity is our own or that of another, we check whether
+    /// there has been any change to the cross-signing keys, and classify
+    /// the result into [`IdentityUpdateResult::Updated`] or
+    /// [`IdentityUpdateResult::Unchanged`].
+    ///
+    /// # Arguments
+    ///
+    /// * `response` - The entire `/keys/query` response.
+    /// * `master_key` - The public master cross-signing key from the
+    ///   `/keys/query` response.
+    /// * `self_signing` - The public self-signing key from the `/keys/query`
+    ///   response.
+    /// * `i` - The existing identity for this user.
+    /// * `changed_private_identity` - Output parameter. Unchanged if the
+    ///   identity is that of another user. If it is our own, set to `None` or
+    ///   `Some` depending on whether our stored private identity needs
+    ///   updating. See above for more detail.
     async fn handle_changed_identity(
         &self,
         response: &KeysQueryResponse,
@@ -431,42 +480,17 @@ impl IdentityManager {
     ) -> Result<IdentityUpdateResult, SignatureError> {
         match i {
             ReadOnlyUserIdentities::Own(mut identity) => {
-                if let Some(user_signing) = response
-                    .user_signing_keys
-                    .get(self.user_id())
-                    .and_then(|k| k.deserialize_as::<UserSigningPubkey>().ok())
-                {
-                    if user_signing.user_id() != self.user_id() {
-                        warn!(
-                            expected = ?self.user_id(),
-                            got = ?user_signing.user_id(),
-                            "User ID mismatch in our user-signing key",
-                        );
-
-                        Err(SignatureError::UserIdMismatch)
-                    } else {
-                        let has_changed =
-                            identity.update(master_key, self_signing, user_signing)?;
-
-                        *changed_private_identity = self.check_private_identity(&identity).await;
-
-                        if has_changed {
-                            Ok(IdentityUpdateResult::Updated(identity.into()))
-                        } else {
-                            Ok(IdentityUpdateResult::Unchanged(identity.into()))
-                        }
-                    }
+                let user_signing = self.get_user_signing_key_from_response(response)?;
+                let has_changed = identity.update(master_key, self_signing, user_signing)?;
+                *changed_private_identity = self.check_private_identity(&identity).await;
+                if has_changed {
+                    Ok(IdentityUpdateResult::Updated(identity.into()))
                 } else {
-                    warn!(
-                        "User identity for our own user didn't contain a user signing public key"
-                    );
-
-                    Err(SignatureError::MissingSigningKey)
+                    Ok(IdentityUpdateResult::Unchanged(identity.into()))
                 }
             }
             ReadOnlyUserIdentities::Other(mut identity) => {
                 let has_changed = identity.update(master_key, self_signing)?;
-
                 if has_changed {
                     Ok(IdentityUpdateResult::Updated(identity.into()))
                 } else {
@@ -476,6 +500,34 @@ impl IdentityManager {
         }
     }
 
+    /// Process an identity received in a `/keys/query` response that we didn't
+    /// previously know about.
+    ///
+    /// If the identity is our own, we will look for a user-signing key, and if
+    /// it is present and correct, all three keys will be returned in the
+    /// `IdentityChange` result; otherwise, an error is returned. We will also
+    /// compare the received public identity against our stored private
+    /// identity; if they match, the returned public identity is marked as
+    /// verified and `*changed_private_identity` is set to `None`. If they do
+    /// *not* match, it is an indication that our identity has been rotated,
+    /// and `*changed_private_identity` is set to our currently-stored
+    /// private identity with the conflicting keys removed (which will need
+    /// to be persisted).
+    ///
+    /// If the identity is that of another user, we just parse the keys into the
+    /// `IdentityChange` result, since all other checks have already been done.
+    ///
+    /// # Arguments
+    ///
+    /// * `response` - The entire `/keys/query` response.
+    /// * `master_key` - The public master cross-signing key from the
+    ///   `/keys/query` response.
+    /// * `self_signing` - The public self-signing key from the `/keys/query`
+    ///   response.
+    /// * `changed_private_identity` - Output parameter. Unchanged if the
+    ///   identity is that of another user. If it is our own, set to `None` or
+    ///   `Some` depending on whether our stored private identity needs
+    ///   updating. See above for more detail.
     async fn handle_new_identity(
         &self,
         response: &KeysQueryResponse,
@@ -484,46 +536,36 @@ impl IdentityManager {
         changed_private_identity: &mut Option<PrivateCrossSigningIdentity>,
     ) -> Result<ReadOnlyUserIdentities, SignatureError> {
         if master_key.user_id() == self.user_id() {
-            if let Some(user_signing) = response
-                .user_signing_keys
-                .get(self.user_id())
-                .and_then(|k| k.deserialize_as::<UserSigningPubkey>().ok())
-            {
-                if user_signing.user_id() != self.user_id() {
-                    warn!(
-                        expected = ?self.user_id(),
-                        got = ?user_signing.user_id(),
-                        "User ID mismatch in our user-signing key",
-                    );
-                    Err(SignatureError::UserIdMismatch)
-                } else {
-                    let identity =
-                        ReadOnlyOwnUserIdentity::new(master_key, self_signing, user_signing)?;
-
-                    *changed_private_identity = self.check_private_identity(&identity).await;
-
-                    Ok(identity.into())
-                }
-            } else {
-                warn!(
-                    "User identity for our own user didn't contain a user signing pubkey or the key \
-                    isn't valid",
-                );
-
-                Err(SignatureError::MissingSigningKey)
-            }
+            let user_signing = self.get_user_signing_key_from_response(response)?;
+            let identity = ReadOnlyOwnUserIdentity::new(master_key, self_signing, user_signing)?;
+            *changed_private_identity = self.check_private_identity(&identity).await;
+            Ok(identity.into())
         } else {
             let identity = ReadOnlyUserIdentity::new(master_key, self_signing)?;
             Ok(identity.into())
         }
     }
 
-    /// Try to deserialize the the master key and self-signing key of a
-    /// identity.
+    /// Try to deserialize the master key and self-signing key of an
+    /// identity from a `/keys/query` response.
     ///
     /// Each user identity *must* at least contain a master and self-signing
-    /// key. Our own identity, in addition to those two, also contains a
-    /// user-signing key.
+    /// key, and this function deserializes them. (Our own identity, in addition
+    /// to those two, also contains a user-signing key, but that is not
+    /// extracted here; see
+    /// [`IdentityManager::get_user_signing_key_from_response`])
+    ///
+    /// # Arguments
+    ///
+    ///  * `master_key` - The master key for a particular user from a
+    ///    `/keys/query` response.
+    ///  * `response` - The entire `/keys/query` response.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the self-signing key couldn't be found in the response, or the
+    /// one of the keys couldn't be deserialized. Else, the deserialized
+    /// public keys.
     fn get_minimal_set_of_keys(
         master_key: &Raw<CrossSigningKey>,
         response: &KeysQueryResponse,
@@ -551,6 +593,62 @@ impl IdentityManager {
         }
     }
 
+    /// Try to deserialize the our user-signing key from a `/keys/query`
+    /// response.
+    ///
+    /// If a `/keys/query` response includes our own cross-signing keys, then it
+    /// should include our user-signing key. This method attempts to
+    /// extract, deserialize, and check the key from the response.
+    ///
+    /// # Arguments
+    ///
+    /// * `response` - the entire `/keys/query` response.
+    fn get_user_signing_key_from_response(
+        &self,
+        response: &KeysQueryResponse,
+    ) -> Result<UserSigningPubkey, SignatureError> {
+        let Some(user_signing) = response
+            .user_signing_keys
+            .get(self.user_id())
+            .and_then(|k| k.deserialize_as::<UserSigningPubkey>().ok())
+        else {
+            warn!(
+                "User identity for our own user didn't contain a user signing pubkey or the key \
+                    isn't valid",
+            );
+            return Err(SignatureError::MissingSigningKey);
+        };
+
+        if user_signing.user_id() != self.user_id() {
+            warn!(
+                expected = ?self.user_id(),
+                got = ?user_signing.user_id(),
+                "User ID mismatch in our user-signing key",
+            );
+            return Err(SignatureError::UserIdMismatch);
+        }
+
+        Ok(user_signing)
+    }
+
+    /// Process the cross-signing keys for a particular identity from a
+    /// `/keys/query` response.
+    ///
+    /// Checks that the keys are consistent, verifies the updates, and produces
+    /// a list of changes to be stored.
+    ///
+    /// # Arguments
+    ///
+    /// * `response` - The entire `/keys/query` response.
+    /// * `changes` - The identity results so far, which we will add to.
+    /// * `changed_identity` - Output parameter: Unchanged if the identity is
+    ///   that of another user. If it is our own, set to `None` or `Some`
+    ///   depending on whether our stored private identity needs updating.
+    /// * `user_id` - The user id of the user whose identity is being processed.
+    /// * `master_key` - The public master cross-signing key for this user from
+    ///   the `/keys/query` response.
+    /// * `self_signing` - The public self-signing key from the `/keys/query`
+    ///   response.
     #[instrument(skip_all, fields(user_id))]
     async fn update_or_create_identity(
         &self,
@@ -562,8 +660,9 @@ impl IdentityManager {
         self_signing: SelfSigningPubkey,
     ) -> StoreResult<()> {
         if master_key.user_id() != user_id || self_signing.user_id() != user_id {
-            warn!(?user_id, "User ID mismatch in one of the cross signing keys",);
+            warn!(?user_id, "User ID mismatch in one of the cross signing keys");
         } else if let Some(i) = self.store.get_user_identity(user_id).await? {
+            // an identity we knew about before, which is being updated
             match self
                 .handle_changed_identity(
                     response,
@@ -587,6 +686,7 @@ impl IdentityManager {
                 }
             }
         } else {
+            // an identity we did not know about before
             match self
                 .handle_new_identity(response, master_key, self_signing, changed_private_identity)
                 .await
@@ -608,10 +708,17 @@ impl IdentityManager {
     ///
     /// # Arguments
     ///
-    /// * `response` - The keys query response.
+    /// * `response` - The `/keys/query` response.
     ///
-    /// Returns a list of identities that changed. Changed here means either
-    /// they are new or one of their properties has changed.
+    /// # Returns
+    ///
+    /// The processed results, to be saved to the datastore, comprising:
+    ///
+    ///  * A list of public identities that were received, categorised as "new",
+    ///    "changed" or "unchanged".
+    ///
+    ///  * If our own identity was updated and did not match our private
+    ///    identity, an update to that private identity. Otherwise, `None`.
     async fn handle_cross_signing_keys(
         &self,
         response: &KeysQueryResponse,
@@ -620,8 +727,8 @@ impl IdentityManager {
         let mut changed_identity = None;
 
         for (user_id, master_key) in &response.master_keys {
-            // Get the master and self-signing key for each identity, those are required for
-            // every user identity type, if we don't have those we skip over.
+            // Get the master and self-signing key for each identity; those are required for
+            // every user identity type. If we don't have those we skip over.
             let Some((master_key, self_signing)) =
                 Self::get_minimal_set_of_keys(master_key.cast_ref(), response)
             else {
@@ -690,20 +797,24 @@ impl IdentityManager {
         // Forget about any previous key queries in flight.
         *self.keys_query_request_details.lock().await = None;
 
-        let (users, sequence_number) = self.store.users_for_key_query().await?;
-
         // We always want to track our own user, but in case we aren't in an encrypted
         // room yet, we won't be tracking ourselves yet. This ensures we are always
         // tracking ourselves.
         //
         // The check for emptiness is done first for performance.
-        let (users, sequence_number) =
-            if users.is_empty() && !self.store.tracked_users().await?.contains(self.user_id()) {
-                self.store.mark_user_as_changed(self.user_id()).await?;
-                self.store.users_for_key_query().await?
+        let (users, sequence_number) = {
+            let cache = self.store.cache().await?;
+            let key_query_manager = self.key_query_manager.synced(&cache).await?;
+
+            let (users, sequence_number) = key_query_manager.users_for_key_query().await;
+
+            if users.is_empty() && !key_query_manager.tracked_users().contains(self.user_id()) {
+                key_query_manager.mark_user_as_changed(self.user_id()).await?;
+                key_query_manager.users_for_key_query().await
             } else {
                 (users, sequence_number)
-            };
+            }
+        };
 
         if users.is_empty() {
             Ok(BTreeMap::new())
@@ -755,9 +866,10 @@ impl IdentityManager {
     /// key query.
     pub async fn receive_device_changes(
         &self,
+        cache: &StoreCache,
         users: impl Iterator<Item = &UserId>,
     ) -> StoreResult<()> {
-        self.store.mark_tracked_users_as_changed(users).await
+        self.key_query_manager.synced(cache).await?.mark_tracked_users_as_changed(users).await
     }
 
     /// See the docs for [`OlmMachine::update_tracked_users()`].
@@ -765,13 +877,145 @@ impl IdentityManager {
         &self,
         users: impl IntoIterator<Item = &UserId>,
     ) -> StoreResult<()> {
-        self.store.update_tracked_users(users.into_iter()).await
+        let cache = self.store.cache().await?;
+        self.key_query_manager.synced(&cache).await?.update_tracked_users(users.into_iter()).await
+    }
+
+    /// Retrieve a list of a user's current devices, so we can encrypt a message
+    /// to them.
+    ///
+    /// If we have not yet seen any devices for the user, and their device list
+    /// has been marked as outdated, then we wait for the `/keys/query` request
+    /// to complete. This helps ensure that we attempt at least once to fetch a
+    /// user's devices before encrypting to them.
+    pub async fn get_user_devices_for_encryption(
+        &self,
+        users: impl Iterator<Item = &UserId>,
+    ) -> StoreResult<HashMap<OwnedUserId, HashMap<OwnedDeviceId, ReadOnlyDevice>>> {
+        // How long we wait for /keys/query to complete.
+        const KEYS_QUERY_WAIT_TIME: Duration = Duration::from_secs(5);
+
+        let mut devices_by_user = HashMap::new();
+        let mut users_with_no_devices_on_failed_servers = Vec::new();
+        let mut users_with_no_devices_on_unfailed_servers = Vec::new();
+
+        for user_id in users {
+            // First of all, check the store for this user.
+            let devices = self.store.get_readonly_devices_filtered(user_id).await?;
+
+            // Now, look for users who have no devices at all.
+            //
+            // If a user has no devices at all, that implies we have never (successfully)
+            // done a `/keys/query` for them; we wait for one to complete if it is
+            // in flight. (Of course, the user might genuinely have no devices, but
+            // that's fine, it just means we redundantly grab the cache guard and
+            // check the pending-query flag.)
+            if !devices.is_empty() {
+                // This user has at least one known device.
+                //
+                // The device list may also be outdated in this case; but in this
+                // situation, we are racing between sending a message and retrieving their
+                // device list. That's an inherently racy situation and there is no real
+                // benefit to waiting for the `/keys/query` request to complete. So we don't
+                // bother.
+                //
+                // We just add their devices to the result and carry on.
+                devices_by_user.insert(user_id.to_owned(), devices);
+                continue;
+            }
+
+            // *However*, if the user's server is currently subject to a backoff due to
+            // previous failures, then `users_for_key_query` won't attempt to query
+            // for the user's devices, so there's no point waiting.
+            //
+            // XXX: this is racy. It's possible that:
+            //  * `failures` included the user's server when `users_for_key_query` was
+            //    called, so the user was not returned in the `KeyQueryRequest`, and:
+            //  * The backoff has now expired.
+            //
+            // In that case, we'll end up waiting for the *next* `users_for_key_query` call,
+            // which might not be for 30 seconds or so. (And by then, it might be `failed`
+            // again.)
+            if self.failures.contains(user_id.server_name()) {
+                users_with_no_devices_on_failed_servers.push(user_id);
+                continue;
+            }
+
+            users_with_no_devices_on_unfailed_servers.push(user_id);
+        }
+
+        if !users_with_no_devices_on_failed_servers.is_empty() {
+            info!(
+                ?users_with_no_devices_on_failed_servers,
+                "Not waiting for `/keys/query` for users whose server has previously failed"
+            );
+        }
+
+        if !users_with_no_devices_on_unfailed_servers.is_empty() {
+            // For each user with no devices, fire off a task to wait for a `/keys/query`
+            // result if one is pending.
+            //
+            // We don't actually update the `devices_by_user` map here since that could
+            // require concurrent access to it. Instead each task returns a
+            // `(OwnedUserId, HashMap)` pair (or rather, an `Option` of one) so that we can
+            // add the results to the map.
+            let results = join_all(
+                users_with_no_devices_on_unfailed_servers
+                    .into_iter()
+                    .map(|user_id| self.get_updated_keys_for_user(KEYS_QUERY_WAIT_TIME, user_id)),
+            )
+            .await;
+
+            // Once all the tasks have completed, process the results.
+            let mut updated_users = Vec::new();
+            for result in results {
+                if let Some((user_id, updated_devices)) = result? {
+                    devices_by_user.insert(user_id.to_owned(), updated_devices);
+                    updated_users.push(user_id);
+                }
+            }
+
+            if !updated_users.is_empty() {
+                info!(
+                    ?updated_users,
+                    "Waited for `/keys/query` to complete for users who have no devices"
+                );
+            }
+        }
+
+        Ok(devices_by_user)
+    }
+
+    /// Helper for get_user_devices_for_encryption.
+    ///
+    /// Waits for any pending `/keys/query` for the given user. If one was
+    /// pending, reloads the device list and returns `Some(user_id,
+    /// device_list)`. If no request was pending, returns `None`.
+    #[allow(clippy::type_complexity)]
+    #[instrument(skip(self))]
+    async fn get_updated_keys_for_user<'a>(
+        &self,
+        timeout_duration: Duration,
+        user_id: &'a UserId,
+    ) -> Result<Option<(&'a UserId, HashMap<OwnedDeviceId, ReadOnlyDevice>)>, CryptoStoreError>
+    {
+        let cache = self.store.cache().await?;
+        match self
+            .key_query_manager
+            .wait_if_user_key_query_pending(cache, timeout_duration, user_id)
+            .await?
+        {
+            UserKeyQueryResult::WasPending => {
+                Ok(Some((user_id, self.store.get_readonly_devices_filtered(user_id).await?)))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
 #[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
 pub(crate) mod testing {
-    #![allow(dead_code)]
     use std::sync::Arc;
 
     use ruma::{
@@ -785,7 +1029,7 @@ pub(crate) mod testing {
         identities::IdentityManager,
         machine::testing::response_from_file,
         olm::{Account, PrivateCrossSigningIdentity},
-        store::{CryptoStoreWrapper, MemoryStore, Store},
+        store::{CryptoStoreWrapper, MemoryStore, PendingChanges, Store},
         types::DeviceKeys,
         verification::VerificationMachine,
         UploadSigningKeysRequest,
@@ -803,15 +1047,20 @@ pub(crate) mod testing {
         device_id!("WSKKLTJZCL")
     }
 
-    pub(crate) async fn manager(user_id: &UserId, device_id: &DeviceId) -> IdentityManager {
-        let identity = PrivateCrossSigningIdentity::new(user_id.into()).await;
+    pub(crate) async fn manager_test_helper(
+        user_id: &UserId,
+        device_id: &DeviceId,
+    ) -> IdentityManager {
+        let identity = PrivateCrossSigningIdentity::new(user_id.into());
         let identity = Arc::new(Mutex::new(identity));
         let user_id = user_id.to_owned();
         let account = Account::with_device_id(&user_id, device_id);
+        let static_account = account.static_data().clone();
         let store = Arc::new(CryptoStoreWrapper::new(&user_id, MemoryStore::new()));
         let verification =
-            VerificationMachine::new(account.static_data.clone(), identity.clone(), store.clone());
-        let store = Store::new(account, identity, store, verification);
+            VerificationMachine::new(static_account.clone(), identity.clone(), store.clone());
+        let store = Store::new(static_account, identity, store, verification);
+        store.save_pending_changes(PendingChanges { account: Some(account) }).await.unwrap();
         IdentityManager::new(store)
     }
 
@@ -871,7 +1120,7 @@ pub(crate) mod testing {
             "user_signing_keys": {}
         }));
         KeyQueryResponse::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     // An updated version of `other_key_query` featuring an additional signature on
@@ -937,9 +1186,10 @@ pub(crate) mod testing {
             "user_signing_keys": {}
         }));
         KeyQueryResponse::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
+    /// Mocked response to a /keys/query request.
     pub fn own_key_query_with_user_id(user_id: &UserId) -> KeyQueryResponse {
         let data = response_from_file(&json!({
           "device_keys": {
@@ -1038,7 +1288,7 @@ pub(crate) mod testing {
           }
         }));
         KeyQueryResponse::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     pub fn own_key_query() -> KeyQueryResponse {
@@ -1069,7 +1319,7 @@ pub(crate) mod testing {
         );
 
         KeyQueryResponse::try_from_http_response(response_from_file(&json))
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 }
 
@@ -1086,7 +1336,9 @@ pub(crate) mod tests {
     use serde_json::json;
     use stream_assert::{assert_closed, assert_pending, assert_ready};
 
-    use super::testing::{device_id, key_query, manager, other_key_query, other_user_id, user_id};
+    use super::testing::{
+        device_id, key_query, manager_test_helper, other_key_query, other_user_id, user_id,
+    };
     use crate::{
         identities::manager::testing::{other_key_query_cross_signed, own_key_query},
         olm::PrivateCrossSigningIdentity,
@@ -1111,33 +1363,37 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_tracked_users() {
-        let manager = manager(user_id(), device_id()).await;
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let alice = user_id!("@alice:example.org");
 
+        let cache = manager.store.cache().await.unwrap();
+        let key_query_manager = manager.key_query_manager.synced(&cache).await.unwrap();
+
+        assert!(key_query_manager.tracked_users().is_empty(), "No users are initially tracked");
+
+        manager.receive_device_changes(&cache, [alice].iter().map(Deref::deref)).await.unwrap();
+
         assert!(
-            manager.store.tracked_users().await.unwrap().is_empty(),
-            "No users are initially tracked"
-        );
-        manager.receive_device_changes([alice].iter().map(Deref::deref)).await.unwrap();
-        assert!(
-            !manager.store.tracked_users().await.unwrap().contains(alice),
+            !key_query_manager.tracked_users().contains(alice),
             "Receiving a device changes update for a user we don't track does nothing"
         );
+
         assert!(
-            !manager.store.users_for_key_query().await.unwrap().0.contains(alice),
+            !key_query_manager.users_for_key_query().await.0.contains(alice),
             "The user we don't track doesn't end up in the `/keys/query` request"
         );
     }
 
     #[async_test]
     async fn test_manager_creation() {
-        let manager = manager(user_id(), device_id()).await;
-        assert!(manager.store.tracked_users().await.unwrap().is_empty())
+        let manager = manager_test_helper(user_id(), device_id()).await;
+        let cache = manager.store.cache().await.unwrap();
+        assert!(manager.key_query_manager.synced(&cache).await.unwrap().tracked_users().is_empty())
     }
 
     #[async_test]
     async fn test_manager_key_query_response() {
-        let manager = manager(user_id(), device_id()).await;
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let other_user = other_user_id();
         let devices = manager.store.get_user_devices(other_user).await.unwrap();
         assert_eq!(devices.devices().count(), 0);
@@ -1164,7 +1420,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_manager_own_key_query_response() {
-        let manager = manager(user_id(), device_id()).await;
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let our_user = user_id();
         let devices = manager.store.get_user_devices(our_user).await.unwrap();
         assert_eq!(devices.devices().count(), 0);
@@ -1174,7 +1430,8 @@ pub(crate) mod tests {
         let identity_request = private_identity.as_upload_request().await;
         drop(private_identity);
 
-        let device_keys = manager.store.cache().await.unwrap().account.device_keys().await;
+        let device_keys =
+            manager.store.cache().await.unwrap().account().await.unwrap().device_keys();
         manager
             .receive_keys_query_response(
                 &TransactionId::new(),
@@ -1183,8 +1440,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let identity = manager.store.get_user_identity(our_user).await.unwrap().unwrap();
-        let identity = identity.own().unwrap();
+        let identity = manager
+            .store
+            .get_user_identity(our_user)
+            .await
+            .unwrap()
+            .expect("missing user identity");
+        let identity = identity.own().expect("missing own identity");
         assert!(identity.is_verified());
 
         let devices = manager.store.get_user_devices(our_user).await.unwrap();
@@ -1197,9 +1459,9 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn private_identity_invalidation_after_public_keys_change() {
+    async fn test_private_identity_invalidation_after_public_keys_change() {
         let user_id = user_id!("@example1:localhost");
-        let manager = manager(user_id, "DEVICEID".into()).await;
+        let manager = manager_test_helper(user_id, "DEVICEID".into()).await;
 
         let identity_request = {
             let private_identity = manager.store.private_identity();
@@ -1226,7 +1488,7 @@ pub(crate) mod tests {
         });
 
         let response = KeysQueryResponse::try_from_http_response(response_from_file(&response))
-            .expect("Can't parse the keys query response");
+            .expect("Can't parse the `/keys/query` response");
 
         manager.receive_keys_query_response(&TransactionId::new(), &response).await.unwrap();
 
@@ -1235,7 +1497,7 @@ pub(crate) mod tests {
         assert!(identity.is_verified());
 
         let identity_request = {
-            let private_identity = PrivateCrossSigningIdentity::new(user_id.into()).await;
+            let private_identity = PrivateCrossSigningIdentity::new(user_id.into());
             private_identity.as_upload_request().await
         };
 
@@ -1276,7 +1538,7 @@ pub(crate) mod tests {
         });
 
         let response = KeysQueryResponse::try_from_http_response(response_from_file(&response))
-            .expect("Can't parse the keys query response");
+            .expect("Can't parse the `/keys/query` response");
 
         let (_, private_identity) = manager.handle_cross_signing_keys(&response).await.unwrap();
 
@@ -1286,19 +1548,26 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn no_tracked_users_key_query_request() {
-        let manager = manager(user_id(), device_id()).await;
+    async fn test_no_tracked_users_key_query_request() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
 
+        let cache = manager.store.cache().await.unwrap();
         assert!(
-            manager.store.tracked_users().await.unwrap().is_empty(),
+            manager.key_query_manager.synced(&cache).await.unwrap().tracked_users().is_empty(),
             "No users are initially tracked"
         );
 
         let requests = manager.users_for_key_query().await.unwrap();
-
         assert!(!requests.is_empty(), "We query the keys for our own user");
+
         assert!(
-            manager.store.tracked_users().await.unwrap().contains(manager.user_id()),
+            manager
+                .key_query_manager
+                .synced(&cache)
+                .await
+                .unwrap()
+                .tracked_users()
+                .contains(manager.user_id()),
             "Our own user is now tracked"
         );
     }
@@ -1307,8 +1576,8 @@ pub(crate) mod tests {
     /// user is not removed from the list of outdated users when the
     /// response is received
     #[async_test]
-    async fn invalidation_race_handling() {
-        let manager = manager(user_id(), device_id()).await;
+    async fn test_invalidation_race_handling() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let alice = other_user_id();
         manager.update_tracked_users([alice]).await.unwrap();
 
@@ -1317,7 +1586,10 @@ pub(crate) mod tests {
         assert!(req.device_keys.contains_key(alice));
 
         // another invalidation turns up
-        manager.receive_device_changes([alice].into_iter()).await.unwrap();
+        {
+            let cache = manager.store.cache().await.unwrap();
+            manager.receive_device_changes(&cache, [alice].into_iter()).await.unwrap();
+        }
 
         // the response from the query arrives
         manager.receive_keys_query_response(&reqid, &other_key_query()).await.unwrap();
@@ -1335,20 +1607,23 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn failure_handling() {
-        let manager = manager(user_id(), device_id()).await;
+    async fn test_failure_handling() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let alice = user_id!("@alice:example.org");
 
-        assert!(
-            manager.store.tracked_users().await.unwrap().is_empty(),
-            "No users are initially tracked"
-        );
-        manager.store.mark_user_as_changed(alice).await.unwrap();
+        {
+            let cache = manager.store.cache().await.unwrap();
+            let key_query_manager = manager.key_query_manager.synced(&cache).await.unwrap();
+            assert!(key_query_manager.tracked_users().is_empty(), "No users are initially tracked");
 
-        assert!(
-            manager.store.tracked_users().await.unwrap().contains(alice),
-            "Alice is tracked after being marked as tracked"
-        );
+            key_query_manager.mark_user_as_changed(alice).await.unwrap();
+
+            assert!(
+                key_query_manager.tracked_users().contains(alice),
+                "Alice is tracked after being marked as tracked"
+            );
+        }
+
         let (reqid, req) = manager.users_for_key_query().await.unwrap().pop_first().unwrap();
         assert!(req.device_keys.contains_key(alice));
 
@@ -1376,7 +1651,7 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_out_of_band_key_query() {
         // build the request
-        let manager = manager(user_id(), device_id()).await;
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let (reqid, req) = manager.build_key_query_for_users(vec![user_id()]);
         assert!(req.device_keys.contains_key(user_id()));
 
@@ -1394,8 +1669,8 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn devices_stream() {
-        let manager = manager(user_id(), device_id()).await;
+    async fn test_devices_stream() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let (request_id, _) = manager.build_key_query_for_users(vec![user_id()]);
 
         let stream = manager.store.devices_stream();
@@ -1408,8 +1683,8 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn identities_stream() {
-        let manager = manager(user_id(), device_id()).await;
+    async fn test_identities_stream() {
+        let manager = manager_test_helper(user_id(), device_id()).await;
         let (request_id, _) = manager.build_key_query_for_users(vec![user_id()]);
 
         let stream = manager.store.user_identities_stream();
@@ -1422,8 +1697,8 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn identities_stream_raw() {
-        let mut manager = Some(manager(user_id(), device_id()).await);
+    async fn test_identities_stream_raw() {
+        let mut manager = Some(manager_test_helper(user_id(), device_id()).await);
         let (request_id, _) = manager.as_ref().unwrap().build_key_query_for_users(vec![user_id()]);
 
         let stream = manager.as_ref().unwrap().store.identities_stream_raw();
@@ -1447,7 +1722,7 @@ pub(crate) mod tests {
         let (new_request_id, _) =
             manager.as_ref().unwrap().build_key_query_for_users(vec![user_id()]);
 
-        // A second `keys/query` response with the same result shouldn't fire a change
+        // A second `/keys/query` response with the same result shouldn't fire a change
         // notification: the identity should be unchanged.
         manager
             .as_ref()
@@ -1467,8 +1742,8 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn identities_stream_raw_signature_update() {
-        let mut manager = Some(manager(user_id(), device_id()).await);
+    async fn test_identities_stream_raw_signature_update() {
+        let mut manager = Some(manager_test_helper(user_id(), device_id()).await);
         let (request_id, _) =
             manager.as_ref().unwrap().build_key_query_for_users(vec![other_user_id()]);
 

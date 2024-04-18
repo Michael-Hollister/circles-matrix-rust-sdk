@@ -40,7 +40,7 @@ use ruma::{
     events::secret::request::SecretName, DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
     RoomId, TransactionId, UserId,
 };
-use rusqlite::OptionalExtension;
+use rusqlite::{params_from_iter, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{fs, sync::Mutex};
 use tracing::{debug, instrument, warn};
@@ -49,7 +49,8 @@ use crate::{
     error::{Error, Result},
     get_or_create_store_cipher,
     utils::{
-        load_db_version, Key, SqliteConnectionExt as _, SqliteObjectExt, SqliteObjectStoreExt as _,
+        load_db_version, repeat_vars, Key, SqliteConnectionExt as _, SqliteObjectExt,
+        SqliteObjectStoreExt as _,
     },
     OpenStoreError,
 };
@@ -476,7 +477,10 @@ trait SqliteObjectCryptoStoreExt: SqliteObjectExt {
             .await?)
     }
 
-    async fn get_inbound_group_session_counts(&self) -> Result<RoomKeyCounts> {
+    async fn get_inbound_group_session_counts(
+        &self,
+        _backup_version: Option<&str>,
+    ) -> Result<RoomKeyCounts> {
         let total = self
             .query_row("SELECT count(*) FROM inbound_group_session", (), |row| row.get(0))
             .await?;
@@ -497,6 +501,29 @@ trait SqliteObjectCryptoStoreExt: SqliteObjectExt {
                 move |mut stmt| stmt.query((limit,))?.mapped(|row| row.get(0)).collect(),
             )
             .await?)
+    }
+
+    async fn mark_inbound_group_sessions_as_backed_up(&self, session_ids: Vec<Key>) -> Result<()> {
+        if session_ids.is_empty() {
+            // We are not expecting to be called with an empty list of sessions
+            warn!("No sessions to mark as backed up!");
+            return Ok(());
+        }
+
+        let session_ids_len = session_ids.len();
+
+        self.chunk_large_query_over(session_ids, None, move |session_ids| {
+            async move {
+                // Safety: placeholders is not generated using any user input except the number
+                // of session IDs, so it is safe from injection.
+                let sql_params = repeat_vars(session_ids_len);
+                let query = format!("UPDATE inbound_group_session SET backed_up = TRUE where session_id IN ({sql_params})");
+                self.prepare(query, move |mut stmt| stmt.execute(params_from_iter(session_ids.iter()))).await?;
+                Ok(Vec::<&str>::new())
+            }
+        }).await?;
+
+        Ok(())
     }
 
     async fn reset_inbound_group_session_backup_state(&self) -> Result<()> {
@@ -693,7 +720,7 @@ impl CryptoStore for SqliteCryptoStore {
 
         let pickled_account = if let Some(account) = changes.account {
             *self.static_account.write().unwrap() = Some(account.static_data().clone());
-            Some(account.pickle().await)
+            Some(account.pickle())
         } else {
             None
         };
@@ -916,12 +943,16 @@ impl CryptoStore for SqliteCryptoStore {
             .collect()
     }
 
-    async fn inbound_group_session_counts(&self) -> Result<RoomKeyCounts> {
-        Ok(self.acquire().await?.get_inbound_group_session_counts().await?)
+    async fn inbound_group_session_counts(
+        &self,
+        backup_version: Option<&str>,
+    ) -> Result<RoomKeyCounts> {
+        Ok(self.acquire().await?.get_inbound_group_session_counts(backup_version).await?)
     }
 
     async fn inbound_group_sessions_for_backup(
         &self,
+        _backup_version: &str,
         limit: usize,
     ) -> Result<Vec<InboundGroupSession>> {
         self.acquire()
@@ -934,6 +965,23 @@ impl CryptoStore for SqliteCryptoStore {
                 Ok(InboundGroupSession::from_pickle(pickle)?)
             })
             .collect()
+    }
+
+    async fn mark_inbound_group_sessions_as_backed_up(
+        &self,
+        _backup_version: &str,
+        session_ids: &[(&RoomId, &str)],
+    ) -> Result<()> {
+        Ok(self
+            .acquire()
+            .await?
+            .mark_inbound_group_sessions_as_backed_up(
+                session_ids
+                    .iter()
+                    .map(|(_, s)| self.encode_key("inbound_group_session", s))
+                    .collect(),
+            )
+            .await?)
     }
 
     async fn reset_backup_state(&self) -> Result<()> {
