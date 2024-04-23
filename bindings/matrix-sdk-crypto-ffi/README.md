@@ -22,7 +22,7 @@ From repo root:
 
 After launching the container, use the build script provided in `circles-rust-components-kotlin`
 to generate the libraries and kotlin bindings (ran from `circles-rust-components-kotlin` root):
-* Release (all targets): ./scripts/build.sh -p /matrix-rust-sdk -m crypto -t -r -o .
+* Release (all targets): `./scripts/build.sh -p /matrix-rust-sdk -m crypto -t -r -o .`
 
 ## Original build process
 
