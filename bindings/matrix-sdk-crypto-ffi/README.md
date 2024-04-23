@@ -20,9 +20,9 @@ From repo root:
 * Building image: `docker build --tag futo/matrix_sdk_crypto_ffi_builder:latest .`
 * Running image: `docker run -it --rm -v .:/matrix-rust-sdk -v <ABSOLUTE_PATH_TO_REPO>:/circles-rust-components-kotlin futo/matrix_sdk_crypto_ffi_builder`
 
-From building libraries (from bindings/matrix-sdk-crypto-ffi):
-* Debug build: `cargo ndk --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android --target i686-linux-android build`
-* Release build: `cargo ndk --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android --target i686-linux-android build --release`
+After launching the container, use the build script provided in `circles-rust-components-kotlin`
+to generate the libraries and kotlin bindings (ran from `circles-rust-components-kotlin` root):
+* Release (all targets): ./scripts/build.sh -p /matrix-rust-sdk -m crypto -t -r -o .
 
 ## Original build process
 
