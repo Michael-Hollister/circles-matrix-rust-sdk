@@ -98,30 +98,6 @@ impl SessionManager {
         self.outgoing_to_device_requests.write().unwrap().remove(id);
     }
 
-    /// Generates a `m.dummy` to-device request
-    pub async fn generate_dummy_request(&self, device: crate::Device) -> OlmResult<()> {
-        let (_, content) = device.encrypt("m.dummy", ToDeviceDummyEventContent::new()).await?;
-
-        let request = ToDeviceRequest::new(
-            device.user_id(),
-            device.device_id().to_owned(),
-            content.event_type(),
-            content.cast(),
-        );
-
-        let request = OutgoingRequest {
-            request_id: request.txn_id.clone(),
-            request: Arc::new(request.into()),
-        };
-
-        self.outgoing_to_device_requests
-            .write()
-            .unwrap()
-            .insert(request.request_id.clone(), request);
-
-        Ok(())
-    }
-
     pub async fn mark_device_as_wedged(
         &self,
         sender: &UserId,
@@ -189,7 +165,25 @@ impl SessionManager {
             .is_some_and(|d| d.remove(device_id))
         {
             if let Some(device) = self.store.get_device(user_id, device_id).await? {
-                self.generate_dummy_request(device).await?;
+                let (_, content) =
+                    device.encrypt("m.dummy", ToDeviceDummyEventContent::new()).await?;
+
+                let request = ToDeviceRequest::new(
+                    device.user_id(),
+                    device.device_id().to_owned(),
+                    content.event_type(),
+                    content.cast(),
+                );
+
+                let request = OutgoingRequest {
+                    request_id: request.txn_id.clone(),
+                    request: Arc::new(request.into()),
+                };
+
+                self.outgoing_to_device_requests
+                    .write()
+                    .unwrap()
+                    .insert(request.request_id.clone(), request);
             }
         }
 
@@ -562,11 +556,14 @@ impl SessionManager {
                     }
                 };
 
-                self.key_request_machine.retry_keyshare(user_id, device_id);
-
+                // MSC3061: Change order of `retry_keyshare` and `check_if_unwedged`.
+                // We want to generate an m.dummy request before we retry sharing keys
+                // if session is wedged.
                 if let Err(e) = self.check_if_unwedged(user_id, device_id).await {
                     error!(?user_id, ?device_id, "Error while treating an unwedged device: {e:?}");
                 }
+
+                self.key_request_machine.retry_keyshare(user_id, device_id);
 
                 let session_info = SessionInfo {
                     session_id: session.session_id().to_owned(),
