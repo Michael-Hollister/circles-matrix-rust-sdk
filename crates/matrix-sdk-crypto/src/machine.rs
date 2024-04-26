@@ -1009,16 +1009,14 @@ impl OlmMachine {
                 }
 
                 // Key forwarding process:
-                // 1. Establish a new Olm session with each device, regardless if there is an
-                //    existing session (`generate_dummy_request`). This is to prevent potential
-                //    session wedging when forwarding keys within an existing session.
-                // 2. Queue keys to be shared and sent out claim request
-                //    (`forward_room_history_key`).
-                // 3. Share keys after Olm session is established when processing key claim
-                //    response (`retry_keyshare`).
+                // 1. Queue keys to be shared and sent out claim request
+                //    (`forward_room_history_key`) to establish a new Olm
+                //    session with each device, regardless if there is an
+                //    existing session. This is to prevent potential session
+                //    wedging when forwarding keys within an existing session.
+                // 2. Share keys after Olm session is established when
+                //    processing key claim response (`retry_keyshare`).
                 for device in &devices {
-                    self.inner.session_manager.generate_dummy_request(device.clone()).await?;
-
                     for session in &room_sessions {
                         let info = MegolmV1AesSha2Content {
                             room_id: room_id.to_owned(),
