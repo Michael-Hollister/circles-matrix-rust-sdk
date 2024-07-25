@@ -7,18 +7,18 @@ targeting an x86 Linux project.
 
 To build and distribute bindings for iOS projects, see a [dedicated page](../apple/README.md)
 
-## FUTO Changes
+## Circles Changes
 
 Docker image provided for building Android libraries. Image is also setup to build libraries
 from `circles-rust-components-kotlin`
 
 To build on Mac M1:
 * Uncheck "Use Rosetta for x86/amd64 emulation on Apple Silicon" in Docker desktop settings
-* Building image: `docker build --platform linux/amd64 --tag futo/matrix_sdk_crypto_ffi_builder:latest .`
+* Building image: `docker build --platform linux/amd64 --tag circles/matrix_sdk_crypto_ffi_builder:latest .`
 
 From repo root:
-* Building image: `docker build --tag futo/matrix_sdk_crypto_ffi_builder:latest .`
-* Running image: `docker run -it --rm -v .:/matrix-rust-sdk -v <ABSOLUTE_PATH_TO_REPO>:/circles-rust-components-kotlin futo/matrix_sdk_crypto_ffi_builder`
+* Building image: `docker build --tag circles/matrix_sdk_crypto_ffi_builder:latest .`
+* Running image: `docker run -it --rm -v .:/matrix-rust-sdk -v <ABSOLUTE_PATH_TO_REPO>:/circles-rust-components-kotlin circles/matrix_sdk_crypto_ffi_builder`
 
 After launching the container, use the build script provided in `circles-rust-components-kotlin`
 to generate the libraries and kotlin bindings (ran from `circles-rust-components-kotlin` root):
